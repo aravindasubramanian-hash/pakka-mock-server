@@ -1,0 +1,9 @@
+{
+  "name": "pakka-mock-server",
+  "version": "1.0.0",
+  "description": "Pakka mock MCP server: Delhivery, Pine Labs gaps, Onsitego, Gnani",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  }
+}
