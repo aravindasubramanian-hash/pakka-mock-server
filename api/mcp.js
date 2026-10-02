@@ -1,0 +1,686 @@
+// Pakka Mock MCP Server  —  api/mcp.js
+// Implements MCP Streamable HTTP transport (JSON-RPC 2.0 over POST)
+// 17 tools: Delhivery (6) | Pine Labs gaps (6) | Onsitego (3) | Gnani (2)
+// Deploy on Vercel; register the URL https://<your-app>.vercel.app/api/mcp on AgenticOrg.
+
+'use strict';
+
+// ─────────────────────────────────────────────
+// STATIC MOCK DATA  (matches KB household H001)
+// ─────────────────────────────────────────────
+
+const SERVICEABLE_PINCODES = new Set([
+  '122001','122002','122003','122004','122005',
+  '122006','122007','122008','122009','122010',
+  '110001','110002','110003','110010','110011',
+  '110012','110013','110014','110015','110016',
+  '110017','110018','110019','110020',
+]);
+
+const ENTITLEMENTS = {
+  'VLT-AC-2024-10234': {
+    found: true,
+    serial: 'VLT-AC-2024-10234',
+    appliance_id: 'AC-10234',
+    brand: 'Voltas',
+    model: '1.5T 5-Star Split AC',
+    contract_id: 'W-VLT-AC-2024-10234',
+    contract_type: 'Manufacturer Warranty',
+    status: 'ACTIVE',
+    expiry_date: '2027-04-17',
+    covered_components: [
+      { component: 'Compressor', clause: 'CL-VLT-3.2', deductible_rs: 0 },
+      { component: 'Labour for compressor replacement', clause: 'CL-VLT-3.4', deductible_rs: 0 },
+      { component: 'Refrigerant gas for covered compressor repair', clause: 'CL-VLT-3.5', deductible_rs: 0 },
+    ],
+    visit_charge_rs: 0,
+    diagnosis_charge_rs: 0,
+    inspection_charge_rs: 0,
+    clause_text: {
+      'CL-VLT-3.2': 'Compressor replacement is covered under warranty.',
+      'CL-VLT-3.4': 'Standard labour for compressor replacement is included.',
+      'CL-VLT-3.5': 'Inspection, diagnosis and visit charges for in-warranty breakdowns are Rs 0. Refrigerant gas required to complete or rework a covered compressor repair is covered.',
+      'CL-VLT-6.1': 'Damage caused by proven external electrical events is excluded. Documentary evidence required for this exclusion claim.',
+      'CL-VLT-7.2': 'Optional accessories and non-contractual upgrades are excluded from warranty coverage.',
+    },
+    exclusions: [
+      { reason: 'External electrical damage', clause: 'CL-VLT-6.1', requires_written_evidence: true },
+      { reason: 'Optional accessories / non-contractual upgrades', clause: 'CL-VLT-7.2', requires_written_evidence: false },
+    ],
+    prior_claims: [
+      { date: '2026-08-12', type: 'Compressor repair', status: 'CLOSED' },
+      { date: '2026-09-30', type: 'Diagnostic visit', status: 'CLOSED' },
+    ],
+  },
+
+  'IFB-WM-2023-20881': {
+    found: true,
+    serial: 'IFB-WM-2023-20881',
+    appliance_id: 'WM-20881',
+    brand: 'IFB',
+    model: 'Front Load Washing Machine 8kg',
+    contract_id: 'AMC-IFB-WM-2026-20881',
+    contract_type: 'Annual Maintenance Contract',
+    status: 'ACTIVE',
+    expiry_date: '2027-06-01',
+    covered_components: [
+      { component: 'Standard labour for covered breakdowns', clause: 'AMC-IFB-2.1', deductible_rs: 0 },
+      { component: '2 preventive maintenance visits per AMC year', clause: 'AMC-IFB-2.2', deductible_rs: 0 },
+    ],
+    visit_charge_rs: 0,
+    diagnosis_charge_rs: 0,
+    inspection_charge_rs: 0,
+    exclusions: [
+      { reason: 'Consumables not automatically included', clause: 'AMC-IFB-3.1', requires_written_evidence: false },
+    ],
+    prior_claims: [],
+  },
+
+  'LG-RF-2022-30772': {
+    found: true,
+    serial: 'LG-RF-2022-30772',
+    appliance_id: 'RF-30772',
+    brand: 'LG',
+    model: 'Double Door Refrigerator',
+    contract_id: null,
+    contract_type: null,
+    status: 'NOT_COVERED',
+    expiry_date: null,
+    covered_components: [],
+    visit_charge_rs: null,
+    note: 'No active manufacturer warranty or AMC. All repairs are paid; household-liable amount comes from the provider itemised quotation.',
+  },
+};
+
+// In-memory stores (reset on cold start — fine for demo)
+const serviceRequests = new Map();
+const orders = new Map();
+const shipments = new Map();
+let srSeq = 1000, ordSeq = 5000;
+
+function uid() { return `${Date.now()}-${Math.floor(Math.random() * 9999)}`; }
+
+// ─────────────────────────────────────────────
+// TOOL HANDLERS
+// ─────────────────────────────────────────────
+
+function delhivery_pincode_serviceability({ pin }) {
+  const ok = SERVICEABLE_PINCODES.has(String(pin));
+  return {
+    pin: String(pin),
+    serviceable: ok,
+    edd: ok ? '2-3 business days' : null,
+    error: ok ? null : `Pincode ${pin} is not currently serviceable by Delhivery`,
+  };
+}
+
+function delhivery_create_shipment({ waybill, name, add, pin, phone, product_desc, cod = 0, payment_mode = 'Prepaid' }) {
+  if (!SERVICEABLE_PINCODES.has(String(pin)))
+    return { success: false, error: `Pincode ${pin} not serviceable — run delhivery_pincode_serviceability first` };
+  const edd = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0];
+  const record = { waybill, name, add, pin, phone, product_desc, cod, payment_mode, status: 'CREATED', edd, created_at: new Date().toISOString() };
+  shipments.set(waybill, record);
+  return { success: true, package: { waybill, status: 'CREATED', edd } };
+}
+
+function delhivery_pickup_request({ pickup_location, pickup_date, waybill, pickup_time = '10:00-14:00' }) {
+  return {
+    success: true,
+    pickup_id: `PU-${uid()}`,
+    waybill, pickup_location, pickup_date, pickup_time,
+    status: 'PICKUP_SCHEDULED',
+  };
+}
+
+function delhivery_track_shipment({ waybill }) {
+  const s = shipments.get(waybill);
+  if (!s) return { success: false, error: `Waybill ${waybill} not found. Was delhivery_create_shipment called first?` };
+  return {
+    success: true, waybill,
+    status: 'IN_TRANSIT',
+    current_location: 'Gurugram Sorting Hub',
+    edd: s.edd,
+    events: [
+      { timestamp: new Date(Date.now() - 3600000).toISOString(), status: 'PICKUP_DONE', location: 'Supplier Warehouse' },
+      { timestamp: new Date().toISOString(), status: 'IN_TRANSIT', location: 'Gurugram Sorting Hub' },
+    ],
+  };
+}
+
+function delhivery_maps_distance_matrix({ origin, destination }) {
+  const local = [origin, destination].every(s =>
+    /12[0-9]{4}|[Gg]urugram|[Gg]urgaon/.test(s)
+  );
+  const km = local ? Math.floor(Math.random() * 13) + 3 : Math.floor(Math.random() * 40) + 20;
+  return {
+    origin, destination,
+    distance_km: km,
+    duration_minutes: Math.floor(km * (local ? 3.5 : 2.2)) + 8,
+    within_25km_service_radius: km <= 25,
+  };
+}
+
+function delhivery_entitlement_gate({ serial, part_code, service_event_id }) {
+  const ent = ENTITLEMENTS[serial];
+  if (!ent) {
+    return {
+      dispatch_allowed: false,
+      reason: `Serial ${serial} not found in entitlement records. Treat as UNVERIFIED; dispatch blocked.`,
+      serial, part_code, service_event_id,
+    };
+  }
+  if (ent.status === 'NOT_COVERED') {
+    return {
+      dispatch_allowed: false,
+      reason: 'No active warranty or AMC for this appliance. Parts must be procured on a paid basis; dispatch not authorised by Onsitego.',
+      serial, part_code, service_event_id, entitlement_status: ent.status,
+    };
+  }
+  return {
+    dispatch_allowed: true,
+    reason: `Entitlement verified under ${ent.contract_id} (${ent.contract_type}, expires ${ent.expiry_date}). Dispatch authorised.`,
+    contract_id: ent.contract_id,
+    entitlement_status: ent.status,
+    serial, part_code, service_event_id,
+  };
+}
+
+// ──── Pine Labs gaps ────
+
+function pinelabs_create_order({ merchant_order_id, amount, currency = 'INR', customer_ref, pre_auth = false, description = '' }) {
+  const order_id = `PL-ORD-${++ordSeq}`;
+  const status = pre_auth ? 'PRE_AUTH_CREATED' : 'CREATED';
+  orders.set(order_id, { order_id, merchant_order_id, amount, currency, customer_ref, pre_auth, description, status, created_at: new Date().toISOString() });
+  return {
+    order_id, merchant_order_id, status, amount, currency, pre_auth,
+    created_at: orders.get(order_id).created_at,
+    message: pre_auth
+      ? `Pre-auth hold of Rs ${(amount / 100).toFixed(2)} created. Capture with pinelabs_capture_order after service is CORROBORATED.`
+      : `Order of Rs ${(amount / 100).toFixed(2)} created.`,
+  };
+}
+
+function pinelabs_capture_order({ order_id, amount }) {
+  const o = orders.get(order_id);
+  if (!o) return { success: false, error: `Order ${order_id} not found` };
+  if (o.status === 'CAPTURED') return { success: false, error: 'Order already captured' };
+  if (o.status === 'CANCELLED') return { success: false, error: 'Cannot capture a cancelled order' };
+  if (amount > o.amount) return { success: false, error: `Capture Rs ${(amount/100).toFixed(2)} exceeds pre-auth Rs ${(o.amount/100).toFixed(2)}` };
+  o.status = 'CAPTURED'; o.captured_amount = amount; o.captured_at = new Date().toISOString();
+  return { success: true, order_id, status: 'CAPTURED', captured_amount: amount, captured_at: o.captured_at, message: `Rs ${(amount/100).toFixed(2)} charged.` };
+}
+
+function pinelabs_cancel_order({ order_id, reason = 'Household requested cancellation' }) {
+  const o = orders.get(order_id);
+  if (!o) return { success: false, error: `Order ${order_id} not found` };
+  if (o.status === 'CAPTURED') return { success: false, error: 'Cannot cancel a captured order — use pinelabs_create_refund instead' };
+  o.status = 'CANCELLED'; o.cancelled_at = new Date().toISOString(); o.cancel_reason = reason;
+  return { success: true, order_id, status: 'CANCELLED', cancelled_at: o.cancelled_at, message: 'Pre-auth released. No charge made to household.' };
+}
+
+function pinelabs_get_order({ order_id }) {
+  const o = orders.get(order_id);
+  if (!o) return { found: false, order_id, error: `Order ${order_id} not found. Check merchant_order_id if you do not have the Pine Labs order_id.` };
+  return { found: true, ...o };
+}
+
+function pinelabs_create_payment_link({ merchant_order_id, amount, currency = 'INR', customer_ref, expiry_minutes = 60, description = '' }) {
+  const link_id = `PL-LINK-${uid()}`;
+  const expiry = new Date(Date.now() + expiry_minutes * 60000).toISOString();
+  return {
+    link_id,
+    merchant_order_id,
+    payment_url: `https://payments.pinelabs.com/pay/${link_id}?mock=true`,
+    amount, currency, customer_ref,
+    expiry_at: expiry, status: 'ACTIVE',
+    message: `Payment link Rs ${(amount/100).toFixed(2)} — valid ${expiry_minutes} min. Send to household via WhatsApp.`,
+  };
+}
+
+function pinelabs_create_refund({ order_id, amount, reason = 'Service not performed or charge not owed' }) {
+  const o = orders.get(order_id);
+  if (!o) return { success: false, error: `Order ${order_id} not found` };
+  if (o.status !== 'CAPTURED') return { success: false, error: `Cannot refund — order status is ${o.status}. Only CAPTURED orders can be refunded.` };
+  return {
+    success: true,
+    refund_id: `PL-REF-${uid()}`,
+    order_id, refund_amount: amount, reason,
+    status: 'REFUND_INITIATED',
+    estimated_credit_days: '5-7 business days',
+    message: `Refund Rs ${(amount/100).toFixed(2)} initiated.`,
+  };
+}
+
+// ──── Onsitego ────
+
+function onsitego_entitlement_lookup({ serial }) {
+  const ent = ENTITLEMENTS[serial];
+  if (!ent) {
+    return {
+      found: false, serial,
+      status: 'NOT_FOUND',
+      message: `No entitlement record for serial ${serial}. Coverage is UNVERIFIED — apply R17.`,
+    };
+  }
+  return { ...ent };
+}
+
+function onsitego_book_service({ serial, fault_description, preferred_date, preferred_slot = 'morning', contact_name, contact_phone, address, pincode }) {
+  const sr_id = `OSG-SR-${++srSeq}`;
+  const ent = ENTITLEMENTS[serial];
+  const paid = !ent || ent.status === 'NOT_COVERED';
+  const slots = { morning: '10:00–13:00', afternoon: '13:00–17:00', evening: '17:00–19:00' };
+  const record = {
+    sr_id, serial, fault_description, preferred_date,
+    confirmed_slot: slots[preferred_slot] || preferred_slot,
+    contact_name, contact_phone, address, pincode,
+    service_type: paid ? 'PAID' : 'WARRANTY',
+    contract_id: ent ? ent.contract_id : null,
+    technician_name: paid ? 'Ramesh Kumar' : 'Suresh Sharma',
+    technician_phone: paid ? '98765-00001' : '98765-00002',
+    status: 'BOOKED',
+    created_at: new Date().toISOString(),
+  };
+  serviceRequests.set(sr_id, record);
+  return {
+    success: true,
+    service_request_id: sr_id,
+    status: 'BOOKED',
+    service_type: record.service_type,
+    contract_id: record.contract_id,
+    technician_name: record.technician_name,
+    technician_phone: record.technician_phone,
+    confirmed_date: preferred_date,
+    confirmed_slot: record.confirmed_slot,
+    note: paid
+      ? 'No warranty/AMC found — booked as paid service. Charges apply per technician quote.'
+      : `Booked under ${ent.contract_type} ${ent.contract_id}.`,
+  };
+}
+
+function onsitego_service_status({ service_request_id }) {
+  const sr = serviceRequests.get(service_request_id);
+  if (!sr) return { found: false, service_request_id, error: 'Service request not found. Check the ID returned by onsitego_book_service.' };
+  return { found: true, ...sr };
+}
+
+// ──── Gnani ────
+
+async function gnani_speech_to_text({ audio_url, language, audio_format = 'wav' }) {
+  const key = process.env.GNANI_API_KEY;
+  if (key) {
+    try {
+      const r = await fetch('https://asr.gnani.ai/api/v1/asr', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ audio_url, language, format: audio_format }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        return { success: true, transcript: d.transcript || d.text, language, confidence: d.confidence || null, source: 'gnani_live' };
+      }
+    } catch (_) { /* fall through to mock */ }
+  }
+  const MOCKS = {
+    'hi-IN':    'मेरा एसी बिल्कुल ठंडा नहीं हो रहा, सुबह से बंद है।',
+    'ta-IN':    'என் ஏசி குளிர்ச்சி இல்லாமல் இயங்குகிறது.',
+    'en-IN':    'My air conditioner stopped cooling since this morning.',
+    'hi-IN-en': 'Yaar mera AC bilkul cool nahi kar raha, koi gas leak toh nahi?',
+  };
+  return { success: true, transcript: MOCKS[language] || 'Audio transcription (mock).', language, confidence: 0.91, source: 'mock' };
+}
+
+async function gnani_text_to_speech({ text, language, voice = 'female', output_format = 'wav' }) {
+  const key = process.env.GNANI_API_KEY;
+  if (key) {
+    try {
+      const r = await fetch('https://tts.gnani.ai/api/v1/tts', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, language, voice, format: output_format }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        return { success: true, audio_url: d.audio_url, duration_seconds: d.duration, source: 'gnani_live' };
+      }
+    } catch (_) { /* fall through to mock */ }
+  }
+  return {
+    success: true,
+    audio_url: `https://pakka-mock.vercel.app/mock-audio/${language}-${uid()}.wav`,
+    duration_seconds: Math.ceil(text.length / 12),
+    text, language, voice, source: 'mock',
+  };
+}
+
+// ─────────────────────────────────────────────
+// TOOL DEFINITIONS (MCP schema)
+// ─────────────────────────────────────────────
+
+const TOOLS = [
+  {
+    name: 'delhivery_pincode_serviceability',
+    description: 'Check whether a pincode is serviceable by Delhivery for parts delivery. Call before creating a shipment.',
+    inputSchema: { type: 'object', properties: { pin: { type: 'string', description: '6-digit pincode' } }, required: ['pin'] },
+  },
+  {
+    name: 'delhivery_create_shipment',
+    description: 'Create a Delhivery parts shipment to the household address. Run delhivery_entitlement_gate and delhivery_pincode_serviceability first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        waybill:      { type: 'string', description: 'Unique waybill / tracking number' },
+        name:         { type: 'string', description: 'Recipient full name' },
+        add:          { type: 'string', description: 'Recipient full delivery address' },
+        pin:          { type: 'string', description: 'Recipient pincode' },
+        phone:        { type: 'string', description: 'Recipient phone number' },
+        product_desc: { type: 'string', description: 'Description of parts being shipped' },
+        cod:          { type: 'number', description: 'Cash-on-delivery amount in Rs (0 for prepaid)' },
+        payment_mode: { type: 'string', description: "'Prepaid' or 'COD'" },
+      },
+      required: ['waybill','name','add','pin','phone','product_desc'],
+    },
+  },
+  {
+    name: 'delhivery_pickup_request',
+    description: 'Request Delhivery to pick up a shipment from a supplier or warehouse.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pickup_location: { type: 'string', description: 'Name of pickup location' },
+        pickup_date:     { type: 'string', description: 'Date in YYYY-MM-DD' },
+        waybill:         { type: 'string', description: 'Waybill number of shipment to pick up' },
+        pickup_time:     { type: 'string', description: "Time window e.g. '10:00-14:00'" },
+      },
+      required: ['pickup_location','pickup_date','waybill'],
+    },
+  },
+  {
+    name: 'delhivery_track_shipment',
+    description: 'Track a Delhivery shipment to get current status and ETA.',
+    inputSchema: {
+      type: 'object',
+      properties: { waybill: { type: 'string', description: 'Waybill number to track' } },
+      required: ['waybill'],
+    },
+  },
+  {
+    name: 'delhivery_maps_distance_matrix',
+    description: "Get road distance and travel time between the technician's location and the household. Use to validate technician ETA.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        origin:      { type: 'string', description: 'Origin address, pincode, or location name' },
+        destination: { type: 'string', description: 'Destination address, pincode, or location name' },
+      },
+      required: ['origin','destination'],
+    },
+  },
+  {
+    name: 'delhivery_entitlement_gate',
+    description: 'Verify that parts dispatch is authorised by entitlement before creating a Delhivery shipment. Blocked → do not dispatch; go to R6/R18.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        serial:           { type: 'string', description: 'Appliance serial number' },
+        part_code:        { type: 'string', description: 'Part code or name to dispatch' },
+        service_event_id: { type: 'string', description: 'Service event ID this dispatch is for' },
+      },
+      required: ['serial','part_code','service_event_id'],
+    },
+  },
+  {
+    name: 'pinelabs_create_order',
+    description: 'Create a Pine Labs payment order. Set pre_auth=true to hold the household-liable amount without charging — capture only after service is CORROBORATED.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        merchant_order_id: { type: 'string', description: 'Unique reference — use service event ID, e.g. SE-AC-10234-2026-10-03' },
+        amount:            { type: 'number', description: 'Amount in paise (Rs 1 = 100 paise, so Rs 650 → 65000)' },
+        currency:          { type: 'string', description: "Always 'INR'" },
+        customer_ref:      { type: 'string', description: 'Customer reference — use PL-CUST-H001 for Household H001' },
+        pre_auth:          { type: 'boolean', description: 'true = hold without charging; false = charge immediately' },
+        description:       { type: 'string', description: 'Short description of the charge' },
+      },
+      required: ['merchant_order_id','amount','currency','customer_ref'],
+    },
+  },
+  {
+    name: 'pinelabs_capture_order',
+    description: 'Capture (charge) a pre-authorised Pine Labs order. Call only after service is CORROBORATED and within the household spend limit or with explicit approval.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        order_id: { type: 'string', description: 'Pine Labs order_id returned by pinelabs_create_order' },
+        amount:   { type: 'number', description: 'Amount in paise to capture (≤ pre-auth amount)' },
+      },
+      required: ['order_id','amount'],
+    },
+  },
+  {
+    name: 'pinelabs_cancel_order',
+    description: 'Cancel a Pine Labs order or release a pre-auth hold. Use when household says do not pay, or service is not corroborated, or charge contradicts entitlement.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        order_id: { type: 'string', description: 'Pine Labs order_id to cancel' },
+        reason:   { type: 'string', description: 'Reason for cancellation' },
+      },
+      required: ['order_id'],
+    },
+  },
+  {
+    name: 'pinelabs_get_order',
+    description: 'Get current status of a Pine Labs order. ALWAYS call this before creating a new order or retrying when payment status is unknown or timed out. Never double-charge.',
+    inputSchema: {
+      type: 'object',
+      properties: { order_id: { type: 'string', description: 'Pine Labs order_id to check' } },
+      required: ['order_id'],
+    },
+  },
+  {
+    name: 'pinelabs_create_payment_link',
+    description: 'Create a self-service payment link to send to the household (declined card, low balance, or household prefers to pay directly). One link only — no retries.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        merchant_order_id: { type: 'string', description: 'Unique order reference' },
+        amount:            { type: 'number', description: 'Amount in paise' },
+        currency:          { type: 'string', description: "Always 'INR'" },
+        customer_ref:      { type: 'string', description: 'Customer reference' },
+        expiry_minutes:    { type: 'number', description: 'Link validity in minutes (default 60)' },
+        description:       { type: 'string', description: 'Payment description shown to household' },
+      },
+      required: ['merchant_order_id','amount','currency','customer_ref'],
+    },
+  },
+  {
+    name: 'pinelabs_create_refund',
+    description: 'Initiate a refund for a captured Pine Labs order — use for service recurrence refund or charge not owed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        order_id: { type: 'string', description: 'Pine Labs order_id to refund' },
+        amount:   { type: 'number', description: 'Refund amount in paise' },
+        reason:   { type: 'string', description: 'Reason for refund' },
+      },
+      required: ['order_id','amount'],
+    },
+  },
+  {
+    name: 'onsitego_entitlement_lookup',
+    description: 'Look up warranty or AMC entitlement for an appliance by serial number. Returns covered components, clause text, exclusions, deductible, expiry, and past claims.',
+    inputSchema: {
+      type: 'object',
+      properties: { serial: { type: 'string', description: 'Appliance serial number, e.g. VLT-AC-2024-10234' } },
+      required: ['serial'],
+    },
+  },
+  {
+    name: 'onsitego_book_service',
+    description: 'Book a service visit through Onsitego. Returns technician details and confirmed slot. Run onsitego_entitlement_lookup first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        serial:            { type: 'string', description: 'Appliance serial number' },
+        fault_description: { type: 'string', description: 'Fault as reported by household' },
+        preferred_date:    { type: 'string', description: 'Preferred date YYYY-MM-DD' },
+        preferred_slot:    { type: 'string', description: "'morning' (10-13) | 'afternoon' (13-17) | 'evening' (17-19)" },
+        contact_name:      { type: 'string', description: 'Contact person at service location' },
+        contact_phone:     { type: 'string', description: 'Contact phone' },
+        address:           { type: 'string', description: 'Full service address' },
+        pincode:           { type: 'string', description: 'Pincode of service location' },
+      },
+      required: ['serial','fault_description','preferred_date','contact_name','contact_phone','address','pincode'],
+    },
+  },
+  {
+    name: 'onsitego_service_status',
+    description: 'Get the current status of a service request booked through Onsitego.',
+    inputSchema: {
+      type: 'object',
+      properties: { service_request_id: { type: 'string', description: 'Onsitego service request ID, e.g. OSG-SR-1001' } },
+      required: ['service_request_id'],
+    },
+  },
+  {
+    name: 'gnani_speech_to_text',
+    description: 'Transcribe a household voice note to text (R2). Supports hi-IN (Hindi), ta-IN (Tamil), en-IN (English), hi-IN-en (Hinglish). Always transcribe before processing voice input.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        audio_url:    { type: 'string', description: 'URL of audio file (WAV / MP3 / OGG)' },
+        language:     { type: 'string', description: "'hi-IN' | 'ta-IN' | 'en-IN' | 'hi-IN-en'" },
+        audio_format: { type: 'string', description: "'wav' | 'mp3' | 'ogg' — default wav" },
+      },
+      required: ['audio_url','language'],
+    },
+  },
+  {
+    name: 'gnani_text_to_speech',
+    description: 'Synthesise a spoken reply (R2). Use to read back amounts, ticket numbers, or confirmations on voice calls.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text:          { type: 'string', description: 'Text to speak' },
+        language:      { type: 'string', description: "'hi-IN' | 'ta-IN' | 'en-IN'" },
+        voice:         { type: 'string', description: "'female' | 'male' — default female" },
+        output_format: { type: 'string', description: "'wav' | 'mp3' — default wav" },
+      },
+      required: ['text','language'],
+    },
+  },
+];
+
+// One server, four connectors: ?rail=delhivery|pinelabs|onsitego|gnani
+// returns only that rail's tools. No rail = all 17.
+const RAILS = ['delhivery', 'pinelabs', 'onsitego', 'gnani'];
+function toolsForRail(rail) {
+  if (!rail || !RAILS.includes(rail)) return TOOLS;
+  return TOOLS.filter(t => t.name.startsWith(rail + '_'));
+}
+
+// ─────────────────────────────────────────────
+// DISPATCH
+// ─────────────────────────────────────────────
+
+async function callTool(name, args) {
+  switch (name) {
+    case 'delhivery_pincode_serviceability': return delhivery_pincode_serviceability(args);
+    case 'delhivery_create_shipment':        return delhivery_create_shipment(args);
+    case 'delhivery_pickup_request':         return delhivery_pickup_request(args);
+    case 'delhivery_track_shipment':         return delhivery_track_shipment(args);
+    case 'delhivery_maps_distance_matrix':   return delhivery_maps_distance_matrix(args);
+    case 'delhivery_entitlement_gate':       return delhivery_entitlement_gate(args);
+    case 'pinelabs_create_order':            return pinelabs_create_order(args);
+    case 'pinelabs_capture_order':           return pinelabs_capture_order(args);
+    case 'pinelabs_cancel_order':            return pinelabs_cancel_order(args);
+    case 'pinelabs_get_order':               return pinelabs_get_order(args);
+    case 'pinelabs_create_payment_link':     return pinelabs_create_payment_link(args);
+    case 'pinelabs_create_refund':           return pinelabs_create_refund(args);
+    case 'onsitego_entitlement_lookup':      return onsitego_entitlement_lookup(args);
+    case 'onsitego_book_service':            return onsitego_book_service(args);
+    case 'onsitego_service_status':          return onsitego_service_status(args);
+    case 'gnani_speech_to_text':             return await gnani_speech_to_text(args);
+    case 'gnani_text_to_speech':             return await gnani_text_to_speech(args);
+    default: throw { code: -32601, message: `Tool not found: ${name}` };
+  }
+}
+
+// ─────────────────────────────────────────────
+// VERCEL REQUEST HANDLER
+// ─────────────────────────────────────────────
+
+module.exports = async function handler(req, res) {
+  // CORS — AgenticOrg may call from a different origin
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-ID');
+
+  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+
+  const rail = (req.query && req.query.rail) || null;
+  const railTools = toolsForRail(rail);
+
+  // Health check (GET)
+  if (req.method === 'GET') {
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.0.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    return;
+  }
+
+  if (req.method !== 'POST') { res.status(405).json({ error: 'Method not allowed' }); return; }
+
+  const body = req.body;
+  if (!body || typeof body !== 'object') { res.status(400).json({ error: 'Body must be JSON' }); return; }
+
+  const { jsonrpc, method, params, id } = body;
+
+  // Notifications require no response
+  if (typeof method === 'string' && method.startsWith('notifications/')) {
+    res.status(202).end();
+    return;
+  }
+
+  try {
+    let result;
+
+    switch (method) {
+      case 'initialize':
+        result = {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: rail ? `${rail}_pakka` : 'pakka-mock-server', version: '1.0.0' },
+        };
+        break;
+
+      case 'tools/list':
+        result = { tools: railTools };
+        break;
+
+      case 'tools/call': {
+        if (!params || !params.name) throw { code: -32602, message: 'Missing params.name' };
+        if (!railTools.some(t => t.name === params.name)) throw { code: -32601, message: `Tool ${params.name} is not on rail ${rail}` };
+        const toolResult = await callTool(params.name, params.arguments || {});
+        result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
+        break;
+      }
+
+      case 'ping':
+        result = {};
+        break;
+
+      default:
+        return res.status(200).json({ jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } });
+    }
+
+    res.status(200).json({ jsonrpc: '2.0', id, result });
+  } catch (err) {
+    console.error('[pakka-mock]', err);
+    res.status(200).json({
+      jsonrpc: '2.0', id,
+      error: { code: err.code || -32603, message: err.message || 'Internal server error' },
+    });
+  }
+};
