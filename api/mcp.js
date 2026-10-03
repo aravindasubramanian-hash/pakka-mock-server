@@ -324,10 +324,30 @@ function onsitego_entitlement_lookup({ serial }) {
     };
   }
   // Include the household's service history so one call covers R1 (memory) and R4 (entitlement).
-  return { ...ent, service_history: SERVICE_MEMORY[ent.appliance_id] || [], household: HOUSEHOLD };
+  const today = istToday();
+  return { ...ent, service_history: SERVICE_MEMORY[ent.appliance_id] || [], household: HOUSEHOLD, today: `${today} (${dayName(today)})`, next_bookable_dates: nextWorkingDays(today, 3) };
 }
 
+// Dates in IST. The booking system honours the customer's stored availability (H001: Mon-Sat).
+const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+function istToday() { const d = new Date(Date.now() + 5.5 * 3600000); return d.toISOString().slice(0, 10); }
+function dayName(iso) { const d = new Date(iso + 'T12:00:00Z'); return isNaN(d) ? null : DAYS[d.getUTCDay()]; }
+function nextWorkingDays(fromIso, n) {
+  const out = []; let d = new Date(fromIso + 'T12:00:00Z');
+  while (out.length < n) { d = new Date(d.getTime() + 86400000); if (d.getUTCDay() !== 0) out.push(d.toISOString().slice(0, 10) + ' (' + DAYS[d.getUTCDay()] + ')'); }
+  return out;
+}
 function onsitego_book_service({ serial, fault_description, preferred_date, preferred_slot = 'morning', contact_name, contact_phone, address, pincode }) {
+  const today = istToday();
+  if (!preferred_date || isNaN(new Date(preferred_date + 'T12:00:00Z'))) {
+    return { success: false, error: 'preferred_date must be YYYY-MM-DD', today, next_available_dates: nextWorkingDays(today, 3) };
+  }
+  if (preferred_date <= today) {
+    return { success: false, error: `Earliest bookable date is tomorrow. Today is ${today} (${dayName(today)}).`, next_available_dates: nextWorkingDays(today, 3) };
+  }
+  if (dayName(preferred_date) === 'Sunday') {
+    return { success: false, error: `${preferred_date} is a Sunday, outside household H001 window (Mon-Sat 10:00-18:00).`, next_available_dates: nextWorkingDays(preferred_date, 3) };
+  }
   const sr_id = `OSG-SR-${++srSeq}`;
   const ent = findEntitlement(serial);
   const paid = !ent || ent.status === 'NOT_COVERED';
@@ -440,7 +460,8 @@ function service_memory_read({ appliance_id }) {
   const k = memKey(appliance_id);
   if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, household: HOUSEHOLD, note: 'Appliance not identified. Pick one from household.appliances.' };
   const a = HOUSEHOLD.appliances.find(x => x.appliance_id === k);
-  return { found: true, appliance: a, household: HOUSEHOLD, events: SERVICE_MEMORY[k] };
+  const today = istToday();
+  return { found: true, appliance: a, household: HOUSEHOLD, events: SERVICE_MEMORY[k], today: `${today} (${dayName(today)})` };
 }
 function service_memory_append({ appliance_id, event, amount_rs = 0, evidence_status = 'CLAIMED', next_due_date = null }) {
   const k = memKey(appliance_id);
@@ -842,7 +863,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.9.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.10.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
