@@ -324,7 +324,7 @@ function onsitego_entitlement_lookup({ serial }) {
     };
   }
   // Include the household's service history so one call covers R1 (memory) and R4 (entitlement).
-  return { ...ent, service_history: SERVICE_MEMORY[ent.appliance_id] || [] };
+  return { ...ent, service_history: SERVICE_MEMORY[ent.appliance_id] || [], household: HOUSEHOLD };
 }
 
 function onsitego_book_service({ serial, fault_description, preferred_date, preferred_slot = 'morning', contact_name, contact_phone, address, pincode }) {
@@ -397,6 +397,32 @@ function onsitego_dispute_status({ dispute_id }) {
   return { found: true, ...d, status: 'UNDER_REVIEW', centre_response: 'Centre reviewing the dispute.' };
 }
 
+// Household profile (synthetic, mirrors KB file pakka_kb_01). Returned with lookups so bookings use real facts.
+const HOUSEHOLD = {
+  household_id: 'H001',
+  decision_maker: 'Arjun Mehta', contact_phone: '9000000001',
+  alternate_contact: 'Neha Mehta', alternate_phone: '9000000002',
+  address: 'Sector 45, Gurugram, Haryana', pincode: '122003',
+  service_window: 'Monday-Saturday 10:00-18:00 IST (no Sundays)',
+  spend_limit_rs: 2000,
+  language: 'English; Hindi-English mix acceptable',
+  pine_labs_customer_ref: 'PL-CUST-H001',
+  appliances: [
+    { appliance_id: 'AC-10234', type: 'Split AC', brand: 'Voltas', serial: 'VLT-AC-2024-10234', cover: 'Warranty to 2027-04-17' },
+    { appliance_id: 'WM-20881', type: 'Washing machine', brand: 'IFB', serial: 'IFB-WM-2023-20881', cover: 'AMC to 2027-06-01' },
+    { appliance_id: 'RF-30772', type: 'Refrigerator', brand: 'LG', serial: 'LG-RF-2022-30772', cover: 'None (paid repairs)' },
+  ],
+};
+function resolveAppliance(x) {
+  const q = String(x || '').toLowerCase();
+  const ent = findEntitlement(x);
+  if (ent) return ent.appliance_id;
+  if (/\bac\b|air ?con|split/.test(q)) return 'AC-10234';
+  if (/wash|wm\b|ifb/.test(q)) return 'WM-20881';
+  if (/fridge|refrig|rf\b|lg/.test(q)) return 'RF-30772';
+  return null;
+}
+
 // Pakka's own service memory (appliance record + event log). Seeded from the household's documents.
 const SERVICE_MEMORY = {
   'AC-10234': [
@@ -408,13 +434,13 @@ const SERVICE_MEMORY = {
   'RF-30772': [],
 };
 function memKey(id) {
-  const ent = findEntitlement(id);
-  return ent ? ent.appliance_id : String(id || '').toUpperCase();
+  return resolveAppliance(id) || String(id || '').toUpperCase();
 }
 function service_memory_read({ appliance_id }) {
   const k = memKey(appliance_id);
-  if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, error: 'Unknown appliance. Use AC-10234, WM-20881 or RF-30772 (or the serial).' };
-  return { found: true, appliance_id: k, household_id: 'H001', events: SERVICE_MEMORY[k] };
+  if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, household: HOUSEHOLD, note: 'Appliance not identified. Pick one from household.appliances.' };
+  const a = HOUSEHOLD.appliances.find(x => x.appliance_id === k);
+  return { found: true, appliance: a, household: HOUSEHOLD, events: SERVICE_MEMORY[k] };
 }
 function service_memory_append({ appliance_id, event, amount_rs = 0, evidence_status = 'CLAIMED', next_due_date = null }) {
   const k = memKey(appliance_id);
@@ -816,7 +842,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.8.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.9.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
