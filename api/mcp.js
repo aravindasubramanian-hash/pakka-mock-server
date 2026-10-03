@@ -476,12 +476,19 @@ const SERVICE_MEMORY = {
 function memKey(id) {
   return resolveAppliance(id) || String(id || '').toUpperCase();
 }
+function openItems() {
+  const items = [];
+  for (const o of orders.values()) if (['PRE_AUTH_CREATED', 'CREATED'].includes(o.status)) items.push({ type: 'payment_hold', order_id: o.order_id, merchant_order_id: o.merchant_order_id, amount_rs: o.amount / 100, status: o.status, appliance_id: resolveAppliance(o.merchant_order_id || o.description) });
+  for (const d of disputes.values()) if (!['CHARGE_WITHDRAWN'].includes(d.status)) items.push({ type: 'dispute', dispute_id: d.dispute_id, charge_rs: d.charge_rs, appliance_id: resolveAppliance(d.serial) });
+  for (const r of serviceRequests.values()) if (r.status === 'BOOKED') items.push({ type: 'service_request', service_request_id: r.sr_id, date: r.preferred_date, appliance_id: resolveAppliance(r.serial) });
+  return items;
+}
 function service_memory_read({ appliance_id }) {
   const k = memKey(appliance_id);
-  if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, household: HOUSEHOLD, note: 'Appliance not identified. Pick one from household.appliances.' };
+  if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, household: HOUSEHOLD, open_items: openItems(), note: 'Appliance not identified. open_items lists everything still open for the household (holds, disputes, jobs).' };
   const a = HOUSEHOLD.appliances.find(x => x.appliance_id === k);
   const today = istToday();
-  return { found: true, appliance: a, household: HOUSEHOLD, events: SERVICE_MEMORY[k], today: `${today} (${dayName(today)})` };
+  return { found: true, appliance: a, household: HOUSEHOLD, events: SERVICE_MEMORY[k], open_items: openItems().filter(x => x.appliance_id === k), today: `${today} (${dayName(today)})` };
 }
 function service_memory_append({ appliance_id, event, amount_rs = 0, evidence_status = 'CLAIMED', next_due_date = null }) {
   const k = memKey(appliance_id);
@@ -938,7 +945,7 @@ module.exports = async function handler(req, res) {
     return;
   }
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.12.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.13.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
