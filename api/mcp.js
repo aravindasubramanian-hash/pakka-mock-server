@@ -25,6 +25,14 @@ const ENTITLEMENTS = {
     brand: 'Voltas',
     model: '1.5T 5-Star Split AC',
     contract_id: 'W-VLT-AC-2024-10234',
+    charge_schedule: [
+      { charge: 'Visit / inspection / diagnosis (includes gas check, gas pressure check, leak check)', household_pays_rs: 0, clause: 'CL-VLT-3.5' },
+      { charge: 'Refrigerant gas refill to complete or rework the covered compressor repair (last repair 2026-08-12)', household_pays_rs: 0, clause: 'CL-VLT-3.5' },
+      { charge: 'Refrigerant gas refill for any other cause', household_pays_rs: null, clause: null, note: 'Not stated in contract: ask the centre for an itemised written quote; treat as ambiguous (R6) until clarified' },
+      { charge: 'Compressor replacement and its standard labour', household_pays_rs: 0, clause: 'CL-VLT-3.2 / CL-VLT-3.4' },
+      { charge: 'Damage from a proven external electrical event', household_pays_rs: 'per quote', clause: 'CL-VLT-6.1', note: 'Exclusion applies only with documentary evidence' },
+      { charge: 'Optional accessories / upgrades', household_pays_rs: 'per quote', clause: 'CL-VLT-7.2' },
+    ],
     contract_type: 'Manufacturer Warranty',
     status: 'ACTIVE',
     expiry_date: '2027-04-17',
@@ -60,6 +68,11 @@ const ENTITLEMENTS = {
     brand: 'IFB',
     model: 'Front Load Washing Machine 8kg',
     contract_id: 'AMC-IFB-WM-2026-20881',
+    charge_schedule: [
+      { charge: 'Visit / inspection / diagnosis', household_pays_rs: 0, clause: 'AMC-IFB-2.1' },
+      { charge: 'Standard labour for covered breakdowns', household_pays_rs: 0, clause: 'AMC-IFB-2.1' },
+      { charge: 'Consumables (e.g. detergent, filters)', household_pays_rs: 'per quote', clause: 'AMC-IFB-3.1' },
+    ],
     contract_type: 'Annual Maintenance Contract',
     status: 'ACTIVE',
     expiry_date: '2027-06-01',
@@ -89,6 +102,7 @@ const ENTITLEMENTS = {
     covered_components: [],
     visit_charge_rs: null,
     note: 'No active manufacturer warranty or AMC. All repairs are paid; household-liable amount comes from the provider itemised quotation.',
+    charge_schedule: [ { charge: 'All visits, parts and labour', household_pays_rs: 'per itemised quote', clause: null } ],
   },
 };
 
@@ -802,7 +816,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.7.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.8.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
