@@ -614,7 +614,18 @@ function normalizeArgs(a) {
 // DISPATCH
 // ─────────────────────────────────────────────
 
+// AgenticOrg may send a qualified or display name, e.g. "mcp_onsitego_pakka:onsitego_entitlement_lookup",
+// "mcp_onsitego_pakka__onsitego_entitlement_lookup" or "Onsitego Entitlement Lookup". Map it back to our name.
+function resolveToolName(raw) {
+  if (!raw) return raw;
+  const names = TOOLS.map(t => t.name);
+  let n = String(raw).trim().split(/[:.\/]/).pop().toLowerCase().replace(/[\s-]+/g, '_');
+  if (names.includes(n)) return n;
+  return names.find(t => n.endsWith(t)) || n;
+}
+
 async function callTool(name, args) {
+  name = resolveToolName(name);
   switch (name) {
     case 'delhivery_pincode_serviceability': return delhivery_pincode_serviceability(args);
     case 'delhivery_create_shipment':        return delhivery_create_shipment(args);
@@ -654,7 +665,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.0.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.2.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
@@ -692,9 +703,8 @@ module.exports = async function handler(req, res) {
         if (!params || !params.name) throw { code: -32602, message: 'Missing params.name' };
         // Rail only filters tools/list. Calls are accepted on any rail, because the
         // platform may route a tool through a different connector URL than it listed it on.
-        console.log(`[pakka-mock] call rail=${rail || 'all'} tool=${params.name} args=${JSON.stringify(params.arguments || {})}`);
         const args = normalizeArgs(params.arguments);
-        console.log('[pakka-mock] call', JSON.stringify({ rail, tool: params.name, raw: params.arguments, args }));
+        console.log('[pakka-mock] call', JSON.stringify({ rail, tool: params.name, resolved: resolveToolName(params.name), raw: params.arguments, args }));
         const toolResult = await callTool(params.name, args);
         if (toolResult && typeof toolResult === 'object') toolResult._received_args = args;
         result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
@@ -711,7 +721,10 @@ module.exports = async function handler(req, res) {
 
     res.status(200).json({ jsonrpc: '2.0', id, result });
   } catch (err) {
-    console.error('[pakka-mock]', err);
+    console.error('[pakka-mock] error', JSON.stringify(err), 'method=' + method, 'params=' + JSON.stringify(params));
+    if (method === 'tools/call') {
+      return res.status(200).json({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: err.message || String(err), tool_requested: params && params.name, known_tools: TOOLS.map(t => t.name) }) }] } });
+    }
     res.status(200).json({
       jsonrpc: '2.0', id,
       error: { code: err.code || -32603, message: err.message || 'Internal server error' },
