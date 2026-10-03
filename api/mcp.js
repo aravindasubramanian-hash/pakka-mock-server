@@ -134,7 +134,16 @@ function delhivery_create_shipment({ waybill, name, add, pin, phone, product_des
   return { success: true, package: { waybill, status: 'CREATED', edd } };
 }
 
+// Scenario E8: no rider in the default 10:00-14:00 slot; the 14:00-18:00 slot has one.
 function delhivery_pickup_request({ pickup_location, pickup_date, waybill, pickup_time = '10:00-14:00' }) {
+  if (String(pickup_time).replace(/\s/g, '') !== '14:00-18:00') {
+    return {
+      success: false, waybill, pickup_date, pickup_time,
+      status: 'NO_RIDER_AVAILABLE',
+      error: 'No rider available for the requested pickup slot.',
+      next_available_slot: { pickup_date, pickup_time: '14:00-18:00' },
+    };
+  }
   return {
     success: true,
     pickup_id: `PU-${uid()}`,
@@ -212,7 +221,11 @@ function delhivery_entitlement_gate({ serial, part_code, service_event_id }) {
 
 // ──── Pine Labs gaps ────
 
+// Scenario E9b: any order of exactly Rs 1,800 (180000 paise) is declined for low balance.
 function pinelabs_create_order({ merchant_order_id, amount, currency = 'INR', customer_ref, pre_auth = false, description = '' }) {
+  if (Number(amount) === 180000) {
+    return { success: false, merchant_order_id, status: 'DECLINED', error_code: 'INSUFFICIENT_BALANCE', error: 'Payment declined: insufficient balance on the customer instrument.' };
+  }
   const order_id = `PL-ORD-${++ordSeq}`;
   const status = pre_auth ? 'PRE_AUTH_CREATED' : 'CREATED';
   orders.set(order_id, { order_id, merchant_order_id, amount, currency, customer_ref, pre_auth, description, status, created_at: new Date().toISOString() });
@@ -232,6 +245,11 @@ function pinelabs_capture_order({ order_id, amount }) {
   if (o.status === 'CANCELLED') return { success: false, error: 'Cannot capture a cancelled order' };
   if (amount > o.amount) return { success: false, error: `Capture Rs ${(amount/100).toFixed(2)} exceeds pre-auth Rs ${(o.amount/100).toFixed(2)}` };
   o.status = 'CAPTURED'; o.captured_amount = amount; o.captured_at = new Date().toISOString();
+  // Scenario E9a: capture of exactly Rs 1,200 succeeds at Pine Labs but the reply times out.
+  if (Number(amount) === 120000 && !o.timeout_shown) {
+    o.timeout_shown = true;
+    return { success: null, order_id, status: 'UNKNOWN', error_code: 'GATEWAY_TIMEOUT', error: 'Capture request timed out. Outcome unknown — check order status before any retry.' };
+  }
   return { success: true, order_id, status: 'CAPTURED', captured_amount: amount, captured_at: o.captured_at, message: `Rs ${(amount/100).toFixed(2)} charged.` };
 }
 
@@ -279,6 +297,10 @@ function pinelabs_create_refund({ order_id, amount, reason = 'Service not perfor
 // ──── Onsitego ────
 
 function onsitego_entitlement_lookup({ serial }) {
+  // Scenario E10: malformed partner reply — coverage fields missing.
+  if (/MALFORMED/i.test(String(serial))) {
+    return { found: true, serial, appliance_id: null, status: 'ACTIVE', contract_id: 'W-UNKNOWN', covered_components: null, exclusions: null, expiry_date: null };
+  }
   const ent = findEntitlement(serial);
   if (!ent) {
     return {
@@ -323,10 +345,68 @@ function onsitego_book_service({ serial, fault_description, preferred_date, pref
   };
 }
 
+// Seeded records so status checks work even after the server restarts. OSG-SR-0777 = scenario E7.
+const SEEDED_SR = {
+  'OSG-SR-0777': {
+    sr_id: 'OSG-SR-0777', serial: 'VLT-AC-2024-10234', fault_description: 'AC not cooling',
+    preferred_date: '2026-10-05', confirmed_slot: '10:00–13:00', service_type: 'WARRANTY', contract_id: 'W-VLT-AC-2024-10234',
+    technician_name: 'Suresh Sharma', technician_phone: '98765-00002', status: 'TECHNICIAN_EN_ROUTE',
+    technician_location: 'Sector 62, Noida 201301', technician_eta_claimed_minutes: 10, household_pincode: '122003',
+  },
+};
 function onsitego_service_status({ service_request_id }) {
-  const sr = serviceRequests.get(service_request_id);
+  const sr = serviceRequests.get(service_request_id) || SEEDED_SR[service_request_id];
   if (!sr) return { found: false, service_request_id, error: 'Service request not found. Check the ID returned by onsitego_book_service.' };
   return { found: true, ...sr };
+}
+
+// Capability 2b: dispute a charge with the authorised centre through the service request.
+const disputes = new Map();
+function onsitego_raise_dispute({ service_request_id, serial, charge_rs, reason, clause, evidence_requested }) {
+  const ent = findEntitlement(serial);
+  const centre = ent && ent.brand === 'Voltas' ? 'VSC-GGN-01' : ent && ent.brand === 'IFB' ? 'IFB-GGN-02' : ent && ent.brand === 'LG' ? 'LG-GGN-03' : 'UNKNOWN';
+  const dispute_id = `DSP-${String(serial || 'X').slice(-5)}-${Date.now().toString().slice(-6)}`;
+  const rec = { dispute_id, service_request_id, serial, charge_rs, reason, clause, evidence_requested, centre, status: 'SENT_TO_CENTRE', raised_at: new Date().toISOString() };
+  disputes.set(dispute_id, rec);
+  return { success: true, ...rec, response_due: 'within 4 hours', note: `Dispute delivered to ${centre} via Onsitego service request.` };
+}
+function onsitego_dispute_status({ dispute_id }) {
+  const d = disputes.get(dispute_id);
+  if (!d) return { found: false, dispute_id, status: 'PENDING', note: 'No centre response yet.' };
+  if (/3\.5/.test(String(d.clause))) {
+    return { found: true, ...d, status: 'CHARGE_WITHDRAWN', centre_response: 'Inspection/gas check is in-warranty diagnosis under CL-VLT-3.5. Charge of Rs ' + (d.charge_rs ?? '') + ' withdrawn. Rs 0 payable.' };
+  }
+  if (/6\.1|electrical|pcb|voltage/i.test(`${d.clause} ${d.reason}`)) {
+    return { found: true, ...d, status: 'EXCLUSION_MAINTAINED', centre_response: 'Centre maintains electrical-event exclusion. Evidence provided: technician job sheet only; no surge report or stabiliser fault record.' };
+  }
+  return { found: true, ...d, status: 'UNDER_REVIEW', centre_response: 'Centre reviewing the dispute.' };
+}
+
+// Pakka's own service memory (appliance record + event log). Seeded from the household's documents.
+const SERVICE_MEMORY = {
+  'AC-10234': [
+    { date: '2026-08-12', event: 'Compressor repair under warranty W-VLT-AC-2024-10234', amount_rs: 0, evidence: 'RECONCILED' },
+    { date: '2026-08-18', event: 'Stabiliser (5 kVA) inspected, functional', amount_rs: 0, evidence: 'RECONCILED' },
+    { date: '2026-09-30', event: 'Diagnostic visit', amount_rs: 0, evidence: 'RECONCILED' },
+  ],
+  'WM-20881': [],
+  'RF-30772': [],
+};
+function memKey(id) {
+  const ent = findEntitlement(id);
+  return ent ? ent.appliance_id : String(id || '').toUpperCase();
+}
+function service_memory_read({ appliance_id }) {
+  const k = memKey(appliance_id);
+  if (!(k in SERVICE_MEMORY)) return { found: false, appliance_id, error: 'Unknown appliance. Use AC-10234, WM-20881 or RF-30772 (or the serial).' };
+  return { found: true, appliance_id: k, household_id: 'H001', events: SERVICE_MEMORY[k] };
+}
+function service_memory_append({ appliance_id, event, amount_rs = 0, evidence_status = 'CLAIMED', next_due_date = null }) {
+  const k = memKey(appliance_id);
+  if (!(k in SERVICE_MEMORY)) return { success: false, error: 'Unknown appliance.' };
+  const entry = { date: new Date().toISOString().slice(0, 10), event, amount_rs, evidence: evidence_status, next_due_date };
+  SERVICE_MEMORY[k].push(entry);
+  return { success: true, appliance_id: k, appended: entry, total_events: SERVICE_MEMORY[k].length };
 }
 
 // ──── Gnani ────
@@ -385,6 +465,39 @@ async function gnani_text_to_speech({ text, language, voice = 'female', output_f
 // ─────────────────────────────────────────────
 
 const TOOLS = [
+  {
+    name: 'onsitego_raise_dispute',
+    description: 'Challenge a doorstep charge with the brand-authorised service centre through the Onsitego service request. Cite the entitlement clause; request written evidence if an exclusion is claimed. Returns a dispute_id.',
+    inputSchema: { type: 'object', properties: {
+      service_request_id: { type: 'string', description: 'Onsitego service request ID if known' },
+      serial: { type: 'string', description: 'Appliance serial number' },
+      charge_rs: { type: 'number', description: 'Amount the technician is asking, in Rs' },
+      reason: { type: 'string', description: 'Why the charge is disputed' },
+      clause: { type: 'string', description: 'Entitlement clause cited, e.g. CL-VLT-3.5' },
+      evidence_requested: { type: 'string', description: 'Written evidence requested from the centre, if any' },
+    }, required: ['serial', 'charge_rs', 'reason'] },
+  },
+  {
+    name: 'onsitego_dispute_status',
+    description: "Get the service centre's response to a dispute raised with onsitego_raise_dispute.",
+    inputSchema: { type: 'object', properties: { dispute_id: { type: 'string', description: 'Dispute ID' } }, required: ['dispute_id'] },
+  },
+  {
+    name: 'service_memory_read',
+    description: "Read the household's service record and event log for an appliance (prior repairs, payments, evidence status). Call first on any trigger (R1).",
+    inputSchema: { type: 'object', properties: { appliance_id: { type: 'string', description: 'Appliance ID (e.g. AC-10234) or serial' } }, required: ['appliance_id'] },
+  },
+  {
+    name: 'service_memory_append',
+    description: 'Append a service event to the appliance record (R23): what was done, amount, evidence status, next due date.',
+    inputSchema: { type: 'object', properties: {
+      appliance_id: { type: 'string', description: 'Appliance ID or serial' },
+      event: { type: 'string', description: 'What happened' },
+      amount_rs: { type: 'number', description: 'Amount paid or held, Rs' },
+      evidence_status: { type: 'string', description: 'CLAIMED | CORROBORATED | RECONCILED | UNRECONCILED' },
+      next_due_date: { type: 'string', description: 'Next service due date YYYY-MM-DD, if any' },
+    }, required: ['appliance_id', 'event'] },
+  },
   {
     name: 'delhivery_pincode_serviceability',
     description: 'Check whether a pincode is serviceable by Delhivery for parts delivery. Call before creating a shipment.',
@@ -661,6 +774,10 @@ async function callTool(name, args) {
     case 'onsitego_entitlement_lookup':      return onsitego_entitlement_lookup(args);
     case 'onsitego_book_service':            return onsitego_book_service(args);
     case 'onsitego_service_status':          return onsitego_service_status(args);
+    case 'onsitego_raise_dispute':           return onsitego_raise_dispute(args);
+    case 'onsitego_dispute_status':          return onsitego_dispute_status(args);
+    case 'service_memory_read':              return service_memory_read(args);
+    case 'service_memory_append':            return service_memory_append(args);
     case 'gnani_speech_to_text':             return await gnani_speech_to_text(args);
     case 'gnani_text_to_speech':             return await gnani_text_to_speech(args);
     default: throw { code: -32601, message: `Tool not found: ${name}` };
@@ -684,7 +801,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.5.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.6.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
