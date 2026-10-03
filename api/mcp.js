@@ -158,16 +158,30 @@ function delhivery_track_shipment({ waybill }) {
   };
 }
 
+// Fixed road distances (Google Maps, Oct 2026) so runs are repeatable. Keyed by pincode pair.
+const ROAD_KM = {
+  '201301|122003': { km: 47, min: 95 },   // Sector 62 Noida -> Sector 45 Gurugram
+  '122001|122003': { km: 8,  min: 25 },
+  '122002|122003': { km: 6,  min: 20 },
+  '122018|122003': { km: 9,  min: 25 },   // service centre area -> household
+  '110001|122003': { km: 32, min: 70 },
+};
 function delhivery_maps_distance_matrix({ origin, destination }) {
-  const local = [origin, destination].every(s =>
-    /12[0-9]{4}|[Gg]urugram|[Gg]urgaon/.test(s)
-  );
-  const km = local ? Math.floor(Math.random() * 13) + 3 : Math.floor(Math.random() * 40) + 20;
+  const pin = s => (String(s || '').match(/\b\d{6}\b/) || [null])[0];
+  const a = pin(origin), b = pin(destination);
+  let d = a && b && (ROAD_KM[`${a}|${b}`] || ROAD_KM[`${b}|${a}`]);
+  if (!d && a && b) {
+    if (a === b) d = { km: 3, min: 12 };
+    else if (a.slice(0, 3) === b.slice(0, 3)) d = { km: 10, min: 30 };   // same city
+    else d = { km: 40, min: 85 };                                        // cross-city NCR
+  }
+  if (!d) return { origin, destination, error: 'Give origin and destination with 6-digit pincodes' };
   return {
     origin, destination,
-    distance_km: km,
-    duration_minutes: Math.floor(km * (local ? 3.5 : 2.2)) + 8,
-    within_25km_service_radius: km <= 25,
+    distance_km: d.km,
+    duration_minutes: d.min,
+    within_25km_service_radius: d.km <= 25,
+    source: 'fixed table (Google Maps road distance)',
   };
 }
 
@@ -241,7 +255,7 @@ function pinelabs_create_payment_link({ merchant_order_id, amount, currency = 'I
   return {
     link_id,
     merchant_order_id,
-    payment_url: `https://payments.pinelabs.com/pay/${link_id}?mock=true`,
+    payment_url: `https://pakka-mock-server.vercel.app/mock-pay/${link_id}`,
     amount, currency, customer_ref,
     expiry_at: expiry, status: 'ACTIVE',
     message: `Payment link Rs ${(amount/100).toFixed(2)} — valid ${expiry_minutes} min. Send to household via WhatsApp.`,
@@ -670,7 +684,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.4.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.5.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
