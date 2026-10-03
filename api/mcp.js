@@ -498,23 +498,53 @@ function service_memory_append({ appliance_id, event, amount_rs = 0, evidence_st
   return { success: true, appliance_id: k, appended: entry, total_events: SERVICE_MEMORY[k].length };
 }
 
-// ──── Gnani ────
+// ──── Gnani (real: Vachana APIs, api.vachana.ai) ────
+// Docs: https://docs.gnani.ai/api/STT/speech-to-text and /api/TTS/tts-inference
+// Auth header is X-API-Key-ID (not Bearer). STT is multipart/form-data with an
+// uploaded file, not a JSON audio_url — so we fetch the given audio_url first,
+// then re-upload the bytes. TTS returns raw binary audio, not a JSON audio_url,
+// so we store the bytes in KV and hand back our own URL that serves them.
+
+const GNANI_BASE = 'https://api.vachana.ai';
+// Our tool's 'hi-IN-en' (Hinglish) has no STT language_code on the real API —
+// closest supported code is hi-IN; TTS does have a real 'hi-en' code (mapped below).
+const STT_LANG_MAP = { 'hi-IN-en': 'hi-IN' };
+const STT_SUPPORTED = new Set(['bn-IN','en-IN','gu-IN','hi-IN','kn-IN','ml-IN','mr-IN','pa-IN','ta-IN','te-IN']);
+const TTS_LANG_MAP = { 'hi-IN-en': 'hi-en' };
+// Voice catalog is per-language; our tool only takes a male/female hint, so map to one named voice each.
+const TTS_VOICE = {
+  'hi-IN':    { female: 'Nalini', male: 'Deepak' },
+  'hi-en':    { female: 'Poorvi', male: 'Poorvi' },
+  'en-IN':    { female: 'Kaveri', male: 'Kaveri' },
+  'ta-IN':    { female: 'Nalini', male: 'Deepak' },
+  default:    { female: 'Nalini', male: 'Deepak' },
+};
 
 async function gnani_speech_to_text({ audio_url, language, audio_format = 'wav' }) {
   const key = process.env.GNANI_API_KEY;
-  if (key) {
+  const sttLang = STT_LANG_MAP[language] || language;
+  if (key && STT_SUPPORTED.has(sttLang)) {
     try {
-      const r = await fetch('https://asr.gnani.ai/api/v1/asr', {
+      const audioResp = await fetch(audio_url, { signal: AbortSignal.timeout(8000) });
+      if (!audioResp.ok) throw new Error('audio_url fetch ' + audioResp.status);
+      const audioBuf = await audioResp.arrayBuffer();
+      const form = new FormData();
+      form.append('audio_file', new Blob([audioBuf]), `audio.${audio_format}`);
+      form.append('language_code', sttLang);
+      form.append('format', 'transcribe');
+      const r = await fetch(`${GNANI_BASE}/stt/v3`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio_url, language, format: audio_format }),
+        headers: { 'X-API-Key-ID': key },
+        body: form,
         signal: AbortSignal.timeout(10000),
       });
       if (r.ok) {
         const d = await r.json();
-        return { success: true, transcript: d.transcript || d.text, language, confidence: d.confidence || null, source: 'gnani_live' };
+        if (d.success) return { success: true, transcript: d.transcript, language, request_id: d.request_id, source: 'gnani_live' };
+      } else {
+        console.error('[pakka-mock] gnani stt http', r.status, await r.text().catch(() => ''));
       }
-    } catch (_) { /* fall through to mock */ }
+    } catch (e) { console.error('[pakka-mock] gnani stt error', String(e)); /* fall through to mock */ }
   }
   const MOCKS = {
     'hi-IN':    'मेरा एसी बिल्कुल ठंडा नहीं हो रहा, सुबह से बंद है।',
@@ -527,23 +557,36 @@ async function gnani_speech_to_text({ audio_url, language, audio_format = 'wav' 
 
 async function gnani_text_to_speech({ text, language, voice = 'female', output_format = 'wav' }) {
   const key = process.env.GNANI_API_KEY;
+  const ttsLang = TTS_LANG_MAP[language] || language;
   if (key) {
     try {
-      const r = await fetch('https://tts.gnani.ai/api/v1/tts', {
+      const voiceMap = TTS_VOICE[ttsLang] || TTS_VOICE.default;
+      const voiceName = voiceMap[voice] || voiceMap.female;
+      const r = await fetch(`${GNANI_BASE}/api/v1/tts/inference`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, language, voice, format: output_format }),
+        headers: { 'X-API-Key-ID': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text, model: 'timbre-v2.5', voice: voiceName, language: ttsLang, speed: 1.0,
+          audio_config: { encoding: 'linear_pcm', container: output_format === 'mp3' ? 'mp3' : 'wav', num_channels: 1, sample_rate: 48000, sample_width: 2 },
+        }),
         signal: AbortSignal.timeout(10000),
       });
       if (r.ok) {
-        const d = await r.json();
-        return { success: true, audio_url: d.audio_url, duration_seconds: d.duration, source: 'gnani_live' };
+        const buf = Buffer.from(await r.arrayBuffer());
+        const id = `tts-${uid()}`;
+        if (KV_URL && KV_TOKEN) {
+          try { await kv(['SET', `pakka_audio_${id}`, buf.toString('base64'), 'EX', 86400]); } catch (e) { console.error('[pakka-mock] kv audio save failed', String(e)); }
+          return { success: true, audio_url: `https://pakka-mock-server.vercel.app/api/mcp?audio=${id}`, duration_seconds: Math.ceil(text.length / 12), source: 'gnani_live' };
+        }
+        // No KV configured — can't hand back a URL for the binary; fall through to mock.
+      } else {
+        console.error('[pakka-mock] gnani tts http', r.status, await r.text().catch(() => ''));
       }
-    } catch (_) { /* fall through to mock */ }
+    } catch (e) { console.error('[pakka-mock] gnani tts error', String(e)); /* fall through to mock */ }
   }
   return {
     success: true,
-    audio_url: `https://pakka-mock.vercel.app/mock-audio/${language}-${uid()}.wav`,
+    audio_url: `https://pakka-mock-server.vercel.app/mock-audio/${language}-${uid()}.wav`,
     duration_seconds: Math.ceil(text.length / 12),
     text, language, voice, source: 'mock',
   };
@@ -944,8 +987,23 @@ module.exports = async function handler(req, res) {
     res.status(200).json({ status: 'reset', store: KV_URL ? 'kv' : 'memory' });
     return;
   }
+  // Serves TTS audio bytes we stored in KV after a real Gnani TTS call (see gnani_text_to_speech).
+  if (req.method === 'GET' && req.query && req.query.audio) {
+    if (!KV_URL || !KV_TOKEN) { res.status(404).json({ error: 'No audio store configured' }); return; }
+    try {
+      const b64 = await kv(['GET', `pakka_audio_${req.query.audio}`]);
+      if (!b64) { res.status(404).json({ error: 'Audio not found or expired' }); return; }
+      const buf = Buffer.from(b64, 'base64');
+      res.setHeader('Content-Type', 'audio/wav');
+      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+      res.status(200).send(buf);
+    } catch (e) {
+      res.status(500).json({ error: 'Failed to read audio: ' + String(e) });
+    }
+    return;
+  }
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.13.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.14.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
