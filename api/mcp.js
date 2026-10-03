@@ -394,8 +394,21 @@ const SEEDED_SR = {
     technician_location: 'Sector 62, Noida 201301', technician_eta_claimed_minutes: 10, household_pincode: '122003',
   },
 };
+// OSG-SR-0500: demo visit booked yesterday for today. Technician on site; once a dispute exists the centre marks it completed.
+function seededToday(id) {
+  if (id !== 'OSG-SR-0500') return null;
+  const today = istToday();
+  const disputed = [...disputes.values()].some(d => resolveAppliance(d.serial) === 'AC-10234');
+  return {
+    sr_id: 'OSG-SR-0500', serial: 'VLT-AC-2024-10234', fault_description: 'AC not cooling', preferred_date: today,
+    confirmed_slot: '10:00–13:00', service_type: 'WARRANTY', contract_id: 'W-VLT-AC-2024-10234',
+    technician_name: 'Suresh Sharma', technician_phone: '98765-00002', centre: 'VSC-GGN-01',
+    status: disputed ? 'COMPLETED_BY_PROVIDER' : 'TECHNICIAN_ON_SITE',
+    provider_note: disputed ? 'Centre reports gas pressure checked and topped up; AC cooling restored. Awaiting household confirmation.' : 'Technician on site, diagnosing.',
+  };
+}
 function onsitego_service_status({ service_request_id }) {
-  const sr = serviceRequests.get(service_request_id) || SEEDED_SR[service_request_id];
+  const sr = serviceRequests.get(service_request_id) || SEEDED_SR[service_request_id] || seededToday(service_request_id);
   if (!sr) return { found: false, service_request_id, error: 'Service request not found. Check the ID returned by onsitego_book_service.' };
   return { found: true, ...sr };
 }
@@ -415,7 +428,7 @@ function onsitego_dispute_status({ dispute_id, serial }) {
   let d = disputes.get(dispute_id);
   if (!d && serial) { const list = [...disputes.values()].filter(x => resolveAppliance(x.serial) === resolveAppliance(serial)); d = list[list.length - 1]; }
   if (!d) return { found: false, dispute_id, status: 'PENDING', note: 'No centre response yet.' };
-  if (/3\.5/.test(String(d.clause))) {
+  if (/3\.5/.test(String(d.clause)) || (resolveAppliance(d.serial) === 'AC-10234' && /gas|visit|inspect|diagnos/i.test(String(d.reason)) && !/refill|top.?up|pcb|electric/i.test(String(d.reason)))) {
     return { found: true, ...d, status: 'CHARGE_WITHDRAWN', centre_response: 'Inspection/gas check is in-warranty diagnosis under CL-VLT-3.5. Charge of Rs ' + (d.charge_rs ?? '') + ' withdrawn. Rs 0 payable.' };
   }
   if (/6\.1|electrical|pcb|voltage/i.test(`${d.clause} ${d.reason}`)) {
@@ -787,6 +800,11 @@ const TOOLS = [
 const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 const STATE_KEY = 'pakka_state_v1';
+function todayBookingEvent() {
+  const y = new Date(Date.now() + 5.5 * 3600000 - 86400000).toISOString().slice(0, 10);
+  return { date: y, event: `Service booked OSG-SR-0500 for ${istToday()} 10:00–13:00 (WARRANTY), technician Suresh Sharma`, service_request_id: 'OSG-SR-0500', evidence: 'CLAIMED' };
+}
+SERVICE_MEMORY['AC-10234'].push(todayBookingEvent());
 const SEED_MEMORY = JSON.parse(JSON.stringify(SERVICE_MEMORY));
 async function kv(cmd) {
   const r = await fetch(KV_URL, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(cmd), signal: AbortSignal.timeout(4000) });
@@ -798,6 +816,7 @@ function resetState() {
   serviceRequests.clear(); orders.clear(); shipments.clear(); disputes.clear();
   for (const k of Object.keys(SERVICE_MEMORY)) delete SERVICE_MEMORY[k];
   Object.assign(SERVICE_MEMORY, JSON.parse(JSON.stringify(SEED_MEMORY)));
+  SERVICE_MEMORY['AC-10234'] = SERVICE_MEMORY['AC-10234'].filter(e => e.service_request_id !== 'OSG-SR-0500').concat([todayBookingEvent()]);
   srSeq = 1000; ordSeq = 5000;
 }
 async function loadState() {
@@ -919,7 +938,7 @@ module.exports = async function handler(req, res) {
     return;
   }
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.11.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.12.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
