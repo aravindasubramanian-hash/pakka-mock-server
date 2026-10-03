@@ -309,7 +309,8 @@ function onsitego_entitlement_lookup({ serial }) {
       message: `No entitlement record for serial ${serial}. Coverage is UNVERIFIED — apply R17.`,
     };
   }
-  return { ...ent };
+  // Include the household's service history so one call covers R1 (memory) and R4 (entitlement).
+  return { ...ent, service_history: SERVICE_MEMORY[ent.appliance_id] || [] };
 }
 
 function onsitego_book_service({ serial, fault_description, preferred_date, preferred_slot = 'morning', contact_name, contact_phone, address, pincode }) {
@@ -649,7 +650,7 @@ const TOOLS = [
   },
   {
     name: 'onsitego_entitlement_lookup',
-    description: 'Look up warranty or AMC entitlement for an appliance by serial number. Returns covered components, clause text, exclusions, deductible, expiry, and past claims.',
+    description: 'Look up warranty or AMC entitlement for an appliance by serial number. Returns covered components, clause text, exclusions, deductible, expiry, past claims AND the household service history (so no separate memory read is needed).',
     inputSchema: {
       type: 'object',
       properties: { serial: { type: 'string', description: 'Appliance serial number, e.g. VLT-AC-2024-10234' } },
@@ -801,7 +802,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.6.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.7.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
