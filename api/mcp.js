@@ -590,6 +590,9 @@ const TOOLS = [
 const RAILS = ['delhivery', 'pinelabs', 'onsitego', 'gnani'];
 function toolsForRail(rail) {
   if (!rail || !RAILS.includes(rail)) return TOOLS;
+  // Platform workaround (03 Oct 2026): AgenticOrg's authorized_tools check accepts only tools
+  // discovered on mcp_pinelabs_pakka, so that connector exposes the full catalogue.
+  if (rail === 'pinelabs') return TOOLS;
   return TOOLS.filter(t => t.name.startsWith(rail + '_'));
 }
 
@@ -665,7 +668,7 @@ module.exports = async function handler(req, res) {
 
   // Health check (GET)
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.2.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.3.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
