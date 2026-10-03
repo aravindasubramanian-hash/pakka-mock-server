@@ -233,82 +233,136 @@ function delhivery_entitlement_gate({ serial, part_code, service_event_id }) {
   };
 }
 
-// ──── Pine Labs gaps ────
+// ──── Pine Labs ("Plural") — real API: api.pluralpay.in (sandbox pluraluat.v2.pinepg.in) ────
+// Status enum and request/response field names mirror the real Plural Orders/Refunds/Payment
+// Links API (www.pinelabs.com/docs/online-payments/api). Legacy flat aliases (merchant_order_id,
+// amount, customer_ref) are kept accepted/returned alongside the real names (merchant_order_reference,
+// order_amount:{value,currency}, purchase_details.customer.customer_id) so already-tested calling
+// conventions keep working while the schema now documents the real contract.
+
+function resolveOrderAmount(order_amount, amount, currency) {
+  if (order_amount && typeof order_amount === 'object') return { value: Number(order_amount.value), currency: order_amount.currency || 'INR' };
+  return { value: Number(amount), currency: currency || 'INR' };
+}
 
 // Scenario E9b: any order of exactly Rs 1,800 (180000 paise) is declined for low balance.
-function pinelabs_create_order({ merchant_order_id, amount, currency = 'INR', customer_ref, pre_auth = false, description = '' }) {
-  if (Number(amount) === 180000) {
-    return { success: false, merchant_order_id, status: 'DECLINED', error_code: 'INSUFFICIENT_BALANCE', error: 'Payment declined: insufficient balance on the customer instrument.' };
+function pinelabs_create_order({
+  merchant_order_reference, merchant_order_id,
+  order_amount, amount, currency = 'INR',
+  customer_id, customer_ref,
+  pre_auth = false, notes, description = '',
+}) {
+  const ref = merchant_order_reference || merchant_order_id;
+  const amt = resolveOrderAmount(order_amount, amount, currency);
+  const note = notes || description;
+  const cust = customer_id || customer_ref;
+  if (Number(amt.value) === 180000) {
+    return { success: false, merchant_order_reference: ref, merchant_order_id: ref, status: 'FAILED', error_code: 'INSUFFICIENT_BALANCE', error: 'Payment declined: insufficient balance on the customer instrument.' };
   }
   const order_id = `PL-ORD-${++ordSeq}`;
-  const status = pre_auth ? 'PRE_AUTH_CREATED' : 'CREATED';
-  orders.set(order_id, { order_id, merchant_order_id, amount, currency, customer_ref, pre_auth, description, status, created_at: new Date().toISOString() });
-  logEvent(merchant_order_id || description, `Pine Labs ${status} ${order_id} Rs ${(amount/100).toFixed(0)}`, { order_id, merchant_order_id });
+  // Real status enum: CREATED | PENDING | PROCESSED | AUTHORIZED | CANCELLED | ATTEMPTED | FAILED | ...
+  // pre_auth=true -> AUTHORIZED (held, awaiting capture); pre_auth=false -> PROCESSED (charged now).
+  const status = pre_auth ? 'AUTHORIZED' : 'PROCESSED';
+  const rec = {
+    order_id, type: 'CHARGE', status,
+    merchant_order_reference: ref, merchant_order_id: ref,
+    order_amount: amt, amount: amt.value, currency: amt.currency,
+    purchase_details: { customer: { customer_id: cust } }, customer_ref: cust,
+    pre_auth, notes: note, description: note,
+    created_at: new Date().toISOString(),
+  };
+  rec.updated_at = rec.created_at;
+  orders.set(order_id, rec);
+  logEvent(ref || note, `Pine Labs ${status} ${order_id} Rs ${(amt.value/100).toFixed(0)}`, { order_id, merchant_order_reference: ref });
   return {
-    order_id, merchant_order_id, status, amount, currency, pre_auth,
-    created_at: orders.get(order_id).created_at,
+    order_id, merchant_order_reference: ref, merchant_order_id: ref, status,
+    order_amount: amt, amount: amt.value, currency: amt.currency, pre_auth,
+    created_at: rec.created_at,
     message: pre_auth
-      ? `Pre-auth hold of Rs ${(amount / 100).toFixed(2)} created. Capture with pinelabs_capture_order after service is CORROBORATED.`
-      : `Order of Rs ${(amount / 100).toFixed(2)} created.`,
+      ? `Pre-auth hold of Rs ${(amt.value / 100).toFixed(2)} created (status AUTHORIZED). Capture with pinelabs_capture_order after service is CORROBORATED.`
+      : `Order of Rs ${(amt.value / 100).toFixed(2)} created and processed.`,
   };
 }
 
-function pinelabs_capture_order({ order_id, amount }) {
+// Real: PUT /api/pay/v1/orders/{order_id}/capture — body: merchant_capture_reference, capture_amount:{value,currency}
+function pinelabs_capture_order({ order_id, merchant_capture_reference, capture_amount, amount }) {
   const o = findOrder(order_id);
   if (!o) return { success: false, error: `Order ${order_id} not found` };
-  if (o.status === 'CAPTURED') return { success: false, error: 'Order already captured' };
+  if (o.status === 'PROCESSED') return { success: false, error: 'Order already captured (status PROCESSED)' };
   if (o.status === 'CANCELLED') return { success: false, error: 'Cannot capture a cancelled order' };
-  if (amount > o.amount) return { success: false, error: `Capture Rs ${(amount/100).toFixed(2)} exceeds pre-auth Rs ${(o.amount/100).toFixed(2)}` };
-  o.status = 'CAPTURED'; o.captured_amount = amount; o.captured_at = new Date().toISOString();
-  logEvent(o.merchant_order_id || o.description, `Pine Labs ${o.order_id} captured Rs ${(amount/100).toFixed(0)}`, { order_id: o.order_id });
+  const amt = resolveOrderAmount(capture_amount, amount, o.currency);
+  if (amt.value > o.amount) return { success: false, error: `Capture Rs ${(amt.value/100).toFixed(2)} exceeds pre-auth Rs ${(o.amount/100).toFixed(2)}` };
   // Scenario E9a: capture of exactly Rs 1,200 succeeds at Pine Labs but the reply times out.
-  if (Number(amount) === 120000 && !o.timeout_shown) {
+  if (Number(amt.value) === 120000 && !o.timeout_shown) {
     o.timeout_shown = true;
     return { success: null, order_id, status: 'UNKNOWN', error_code: 'GATEWAY_TIMEOUT', error: 'Capture request timed out. Outcome unknown — check order status before any retry.' };
   }
-  return { success: true, order_id, status: 'CAPTURED', captured_amount: amount, captured_at: o.captured_at, message: `Rs ${(amount/100).toFixed(2)} charged.` };
+  o.status = 'PROCESSED'; o.captured_amount = amt.value; o.captured_at = new Date().toISOString(); o.updated_at = o.captured_at;
+  o.merchant_capture_reference = merchant_capture_reference;
+  logEvent(o.merchant_order_reference || o.description, `Pine Labs ${o.order_id} captured Rs ${(amt.value/100).toFixed(0)}`, { order_id: o.order_id });
+  return { success: true, order_id, status: 'PROCESSED', order_amount: { value: amt.value, currency: amt.currency }, captured_amount: amt.value, captured_at: o.captured_at, message: `Rs ${(amt.value/100).toFixed(2)} charged.` };
 }
 
+// Real: PUT /api/pay/v1/orders/{order_id}/cancel — no request body fields; only AUTHORIZED (pre-auth, not yet captured) orders can be cancelled.
 function pinelabs_cancel_order({ order_id, reason = 'Household requested cancellation' }) {
   const o = findOrder(order_id);
   if (!o) return { success: false, error: `Order ${order_id} not found` };
-  if (o.status === 'CAPTURED') return { success: false, error: 'Cannot cancel a captured order — use pinelabs_create_refund instead' };
-  o.status = 'CANCELLED'; o.cancelled_at = new Date().toISOString(); o.cancel_reason = reason;
-  logEvent(o.merchant_order_id || o.description, `Pine Labs hold ${o.order_id} cancelled — ${reason}`, { order_id: o.order_id });
+  if (o.status === 'PROCESSED') return { success: false, error: 'Cannot cancel a processed (captured) order — use pinelabs_create_refund instead' };
+  o.status = 'CANCELLED'; o.cancelled_at = new Date().toISOString(); o.updated_at = o.cancelled_at; o.cancel_reason = reason;
+  logEvent(o.merchant_order_reference || o.description, `Pine Labs hold ${o.order_id} cancelled — ${reason}`, { order_id: o.order_id });
   return { success: true, order_id, status: 'CANCELLED', cancelled_at: o.cancelled_at, message: 'Pre-auth released. No charge made to household.' };
 }
 
-function findOrder(id) { return orders.get(id) || [...orders.values()].reverse().find(o => o.merchant_order_id === id); }
+function findOrder(id) { return orders.get(id) || [...orders.values()].reverse().find(o => o.merchant_order_reference === id || o.merchant_order_id === id); }
+// Real: GET /api/pay/v1/orders/{order_id}
 function pinelabs_get_order({ order_id }) {
   const o = findOrder(order_id);
-  if (!o) return { found: false, order_id, error: `Order ${order_id} not found. Check merchant_order_id if you do not have the Pine Labs order_id.` };
+  if (!o) return { found: false, order_id, error: `Order ${order_id} not found. Check merchant_order_reference if you do not have the Pine Labs order_id.` };
   return { found: true, ...o };
 }
 
-function pinelabs_create_payment_link({ merchant_order_id, amount, currency = 'INR', customer_ref, expiry_minutes = 60, description = '' }) {
+// Real: POST /api/pay/v1/paymentlink — body: merchant_payment_link_reference, amount:{value,currency}, expire_by (ISO date-time), customer:{customer_id,...}
+function pinelabs_create_payment_link({
+  merchant_payment_link_reference, merchant_order_id,
+  amount, currency = 'INR',
+  customer_id, customer_ref,
+  expire_by, expiry_minutes = 60,
+  description = '',
+}) {
+  const ref = merchant_payment_link_reference || merchant_order_id;
+  const amt = resolveOrderAmount(amount, amount, currency);
+  const cust = customer_id || customer_ref;
   const link_id = `PL-LINK-${uid()}`;
-  const expiry = new Date(Date.now() + expiry_minutes * 60000).toISOString();
+  const expiry = expire_by || new Date(Date.now() + expiry_minutes * 60000).toISOString();
   return {
-    link_id,
-    merchant_order_id,
-    payment_url: `https://pakka-mock-server.vercel.app/mock-pay/${link_id}`,
-    amount, currency, customer_ref,
-    expiry_at: expiry, status: 'ACTIVE',
-    message: `Payment link Rs ${(amount/100).toFixed(2)} — valid ${expiry_minutes} min. Send to household via WhatsApp.`,
+    payment_link_id: link_id, link_id,
+    payment_link: `https://pakka-mock-server.vercel.app/mock-pay/${link_id}`, payment_url: `https://pakka-mock-server.vercel.app/mock-pay/${link_id}`,
+    merchant_payment_link_reference: ref, merchant_order_id: ref,
+    amount: amt, amount_due: amt, customer: { customer_id: cust }, customer_ref: cust,
+    expire_by: expiry, expiry_at: expiry, status: 'CREATED',
+    description,
+    created_at: new Date().toISOString(),
+    message: `Payment link Rs ${(amt.value/100).toFixed(2)} — valid until ${expiry}. Send to household via WhatsApp.`,
   };
 }
 
-function pinelabs_create_refund({ order_id, amount, reason = 'Service not performed or charge not owed' }) {
+// Real: POST /api/pay/v1/refunds/{order_id} — order_id is a URL path param, not a body field.
+// Body: merchant_order_reference (idempotency key for the refund), order_amount:{value,currency}.
+function pinelabs_create_refund({ order_id, merchant_order_reference, order_amount, amount, reason = 'Service not performed or charge not owed' }) {
   const o = orders.get(order_id);
   if (!o) return { success: false, error: `Order ${order_id} not found` };
-  if (o.status !== 'CAPTURED') return { success: false, error: `Cannot refund — order status is ${o.status}. Only CAPTURED orders can be refunded.` };
+  if (o.status !== 'PROCESSED') return { success: false, error: `Cannot refund — order status is ${o.status}. Only PROCESSED (captured) orders can be refunded.` };
+  const amt = resolveOrderAmount(order_amount, amount, o.currency);
+  const refund_id = `PL-REF-${uid()}`;
   return {
     success: true,
-    refund_id: `PL-REF-${uid()}`,
-    order_id, refund_amount: amount, reason,
-    status: 'REFUND_INITIATED',
+    order_id: refund_id, parent_order_id: order_id,
+    merchant_order_reference: merchant_order_reference || `REF-${order_id}`,
+    type: 'REFUND', status: 'PENDING',
+    order_amount: amt, refund_id, refund_amount: amt.value, reason,
     estimated_credit_days: '5-7 business days',
-    message: `Refund Rs ${(amount/100).toFixed(2)} initiated.`,
+    created_at: new Date().toISOString(),
+    message: `Refund Rs ${(amt.value/100).toFixed(2)} initiated (status PENDING).`,
   };
 }
 
@@ -478,7 +532,7 @@ function memKey(id) {
 }
 function openItems() {
   const items = [];
-  for (const o of orders.values()) if (['PRE_AUTH_CREATED', 'CREATED'].includes(o.status)) items.push({ type: 'payment_hold', order_id: o.order_id, merchant_order_id: o.merchant_order_id, amount_rs: o.amount / 100, status: o.status, appliance_id: resolveAppliance(o.merchant_order_id || o.description) });
+  for (const o of orders.values()) if (['AUTHORIZED', 'CREATED', 'PENDING'].includes(o.status)) items.push({ type: 'payment_hold', order_id: o.order_id, merchant_order_reference: o.merchant_order_reference, merchant_order_id: o.merchant_order_id, amount_rs: o.amount / 100, status: o.status, appliance_id: resolveAppliance(o.merchant_order_reference || o.description) });
   for (const d of disputes.values()) if (!['CHARGE_WITHDRAWN'].includes(d.status)) items.push({ type: 'dispute', dispute_id: d.dispute_id, charge_rs: d.charge_rs, appliance_id: resolveAppliance(d.serial) });
   for (const r of serviceRequests.values()) if (r.status === 'BOOKED') items.push({ type: 'service_request', service_request_id: r.sr_id, date: r.preferred_date, appliance_id: resolveAppliance(r.serial) });
   return items;
@@ -703,78 +757,89 @@ const TOOLS = [
   },
   {
     name: 'pinelabs_create_order',
-    description: 'Create a Pine Labs payment order. Set pre_auth=true to hold the household-liable amount without charging — capture only after service is CORROBORATED.',
+    description: "Create a Pine Labs (Plural) payment order — real API: POST /api/pay/v1/orders. Set pre_auth=true to hold the household-liable amount without charging (status AUTHORIZED) — capture only after service is CORROBORATED. merchant_order_id/amount/customer_ref are accepted as aliases of the real field names below for backward compatibility.",
     inputSchema: {
       type: 'object',
       properties: {
-        merchant_order_id: { type: 'string', description: 'Unique reference — use service event ID, e.g. SE-AC-10234-2026-10-03' },
-        amount:            { type: 'number', description: 'Amount in paise (Rs 1 = 100 paise, so Rs 650 → 65000)' },
-        currency:          { type: 'string', description: "Always 'INR'" },
-        customer_ref:      { type: 'string', description: 'Customer reference — use PL-CUST-H001 for Household H001' },
-        pre_auth:          { type: 'boolean', description: 'true = hold without charging; false = charge immediately' },
-        description:       { type: 'string', description: 'Short description of the charge' },
+        merchant_order_reference: { type: 'string', description: "Real Pine Labs field. Unique order reference assigned by the merchant (1-50 chars) — use service event ID, e.g. SE-AC-10234-2026-10-03. Alias: merchant_order_id." },
+        merchant_order_id:        { type: 'string', description: 'Alias of merchant_order_reference (legacy).' },
+        order_amount:             { type: 'object', description: "Real Pine Labs field: {value, currency}. value is amount in paise (Rs 1 = 100 paise, so Rs 650 → 65000). Alias: flat 'amount' + 'currency'.", properties: { value: { type: 'number' }, currency: { type: 'string' } } },
+        amount:                   { type: 'number', description: 'Alias of order_amount.value — amount in paise (legacy flat field).' },
+        currency:                 { type: 'string', description: "Alias of order_amount.currency. Always 'INR'." },
+        customer_id:              { type: 'string', description: "Real Pine Labs field (nested at purchase_details.customer.customer_id). Use PL-CUST-H001 for Household H001. Alias: customer_ref." },
+        customer_ref:             { type: 'string', description: 'Alias of customer_id (legacy).' },
+        pre_auth:                 { type: 'boolean', description: 'Real Pine Labs field. true = hold without charging (status AUTHORIZED); false = charge immediately (status PROCESSED).' },
+        notes:                    { type: 'string', description: 'Real Pine Labs field (max 100 chars). Short description of the charge. Alias: description.' },
+        description:              { type: 'string', description: 'Alias of notes (legacy).' },
       },
       required: ['merchant_order_id','amount','currency','customer_ref'],
     },
   },
   {
     name: 'pinelabs_capture_order',
-    description: 'Capture (charge) a pre-authorised Pine Labs order. Call only after service is CORROBORATED and within the household spend limit or with explicit approval.',
+    description: 'Capture (charge) an authorised Pine Labs order — real API: PUT /api/pay/v1/orders/{order_id}/capture. Call only after service is CORROBORATED and within the household spend limit or with explicit approval.',
     inputSchema: {
       type: 'object',
       properties: {
-        order_id: { type: 'string', description: 'Pine Labs order_id returned by pinelabs_create_order' },
-        amount:   { type: 'number', description: 'Amount in paise to capture (≤ pre-auth amount)' },
+        order_id:                   { type: 'string', description: 'Pine Labs order_id returned by pinelabs_create_order (URL path param on the real API).' },
+        merchant_capture_reference: { type: 'string', description: 'Real Pine Labs field. Unique identifier for this capture request.' },
+        capture_amount:              { type: 'object', description: 'Real Pine Labs field: {value, currency}. Amount in paise to capture (≤ pre-auth amount). Alias: flat amount.', properties: { value: { type: 'number' }, currency: { type: 'string' } } },
+        amount:                      { type: 'number', description: 'Alias of capture_amount.value (legacy flat field, paise).' },
       },
       required: ['order_id','amount'],
     },
   },
   {
     name: 'pinelabs_cancel_order',
-    description: 'Cancel a Pine Labs order or release a pre-auth hold. Use when household says do not pay, or service is not corroborated, or charge contradicts entitlement.',
+    description: 'Cancel (void) a Pine Labs pre-authorised order / release a hold — real API: PUT /api/pay/v1/orders/{order_id}/cancel (no request body on the real API; reason here is mock-only for the household record). Only AUTHORIZED orders can be cancelled. Use when household says do not pay, or service is not corroborated, or charge contradicts entitlement.',
     inputSchema: {
       type: 'object',
       properties: {
-        order_id: { type: 'string', description: 'Pine Labs order_id to cancel' },
-        reason:   { type: 'string', description: 'Reason for cancellation' },
+        order_id: { type: 'string', description: 'Pine Labs order_id to cancel (URL path param on the real API).' },
+        reason:   { type: 'string', description: 'Reason for cancellation (mock-only, for the household record).' },
       },
       required: ['order_id'],
     },
   },
   {
     name: 'pinelabs_get_order',
-    description: 'Get current status of a Pine Labs order. ALWAYS call this before creating a new order or retrying when payment status is unknown or timed out. Never double-charge.',
+    description: 'Get current status of a Pine Labs order — real API: GET /api/pay/v1/orders/{order_id}. Status is one of CREATED, PENDING, PROCESSED, AUTHORIZED, CANCELLED, ATTEMPTED, FAILED, FULLY_REFUNDED, PARTIALLY_REFUNDED, SETTLED, SETTLEMENT_REJECTED. ALWAYS call this before creating a new order or retrying when payment status is unknown or timed out. Never double-charge.',
     inputSchema: {
       type: 'object',
-      properties: { order_id: { type: 'string', description: 'Pine Labs order_id to check' } },
+      properties: { order_id: { type: 'string', description: 'Pine Labs order_id to check (URL path param on the real API).' } },
       required: ['order_id'],
     },
   },
   {
     name: 'pinelabs_create_payment_link',
-    description: 'Create a self-service payment link to send to the household (declined card, low balance, or household prefers to pay directly). One link only — no retries.',
+    description: 'Create a self-service payment link to send to the household — real API: POST /api/pay/v1/paymentlink (declined card, low balance, or household prefers to pay directly). One link only — no retries.',
     inputSchema: {
       type: 'object',
       properties: {
-        merchant_order_id: { type: 'string', description: 'Unique order reference' },
-        amount:            { type: 'number', description: 'Amount in paise' },
-        currency:          { type: 'string', description: "Always 'INR'" },
-        customer_ref:      { type: 'string', description: 'Customer reference' },
-        expiry_minutes:    { type: 'number', description: 'Link validity in minutes (default 60)' },
-        description:       { type: 'string', description: 'Payment description shown to household' },
+        merchant_payment_link_reference: { type: 'string', description: 'Real Pine Labs field (idempotency key, 1-50 chars). Unique order reference. Alias: merchant_order_id.' },
+        merchant_order_id:               { type: 'string', description: 'Alias of merchant_payment_link_reference (legacy).' },
+        amount:                          { type: 'object', description: 'Real Pine Labs field: {value, currency}. If passed as a flat number it is treated as value in paise (legacy).' },
+        currency:                        { type: 'string', description: "Used only with a flat legacy 'amount' number. Always 'INR'." },
+        customer_id:                     { type: 'string', description: 'Real Pine Labs field (nested under customer). Alias: customer_ref.' },
+        customer_ref:                    { type: 'string', description: 'Alias of customer_id (legacy).' },
+        expire_by:                       { type: 'string', description: 'Real Pine Labs field. ISO 8601 UTC expiry timestamp, max 180 days out. Alias: expiry_minutes.' },
+        expiry_minutes:                  { type: 'number', description: 'Alias (legacy): link validity in minutes from now (default 60) — converted to expire_by.' },
+        description:                     { type: 'string', description: 'Real Pine Labs field. Payment description shown to household.' },
       },
       required: ['merchant_order_id','amount','currency','customer_ref'],
     },
   },
   {
     name: 'pinelabs_create_refund',
-    description: 'Initiate a refund for a captured Pine Labs order — use for service recurrence refund or charge not owed.',
+    description: 'Initiate a refund for a captured (PROCESSED) Pine Labs order — real API: POST /api/pay/v1/refunds/{order_id} (order_id is a URL path param, not a body field, on the real API). Use for service recurrence refund or charge not owed.',
     inputSchema: {
       type: 'object',
       properties: {
-        order_id: { type: 'string', description: 'Pine Labs order_id to refund' },
-        amount:   { type: 'number', description: 'Refund amount in paise' },
-        reason:   { type: 'string', description: 'Reason for refund' },
+        order_id:                  { type: 'string', description: 'Pine Labs order_id to refund (URL path param on the real API).' },
+        merchant_order_reference:  { type: 'string', description: "Real Pine Labs field — idempotency key for this refund request (distinct from the original order's reference)." },
+        order_amount:              { type: 'object', description: 'Real Pine Labs field: {value, currency}. Refund amount in paise. Alias: flat amount.', properties: { value: { type: 'number' }, currency: { type: 'string' } } },
+        amount:                    { type: 'number', description: 'Alias of order_amount.value (legacy flat field, paise).' },
+        reason:                    { type: 'string', description: 'Reason for refund (mock-only, for the household record).' },
       },
       required: ['order_id','amount'],
     },
@@ -1003,7 +1068,7 @@ module.exports = async function handler(req, res) {
     return;
   }
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.14.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.15.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
