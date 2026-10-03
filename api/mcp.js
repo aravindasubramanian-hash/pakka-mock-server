@@ -243,6 +243,7 @@ function pinelabs_create_order({ merchant_order_id, amount, currency = 'INR', cu
   const order_id = `PL-ORD-${++ordSeq}`;
   const status = pre_auth ? 'PRE_AUTH_CREATED' : 'CREATED';
   orders.set(order_id, { order_id, merchant_order_id, amount, currency, customer_ref, pre_auth, description, status, created_at: new Date().toISOString() });
+  logEvent(merchant_order_id || description, `Pine Labs ${status} ${order_id} Rs ${(amount/100).toFixed(0)}`, { order_id, merchant_order_id });
   return {
     order_id, merchant_order_id, status, amount, currency, pre_auth,
     created_at: orders.get(order_id).created_at,
@@ -253,12 +254,13 @@ function pinelabs_create_order({ merchant_order_id, amount, currency = 'INR', cu
 }
 
 function pinelabs_capture_order({ order_id, amount }) {
-  const o = orders.get(order_id);
+  const o = findOrder(order_id);
   if (!o) return { success: false, error: `Order ${order_id} not found` };
   if (o.status === 'CAPTURED') return { success: false, error: 'Order already captured' };
   if (o.status === 'CANCELLED') return { success: false, error: 'Cannot capture a cancelled order' };
   if (amount > o.amount) return { success: false, error: `Capture Rs ${(amount/100).toFixed(2)} exceeds pre-auth Rs ${(o.amount/100).toFixed(2)}` };
   o.status = 'CAPTURED'; o.captured_amount = amount; o.captured_at = new Date().toISOString();
+  logEvent(o.merchant_order_id || o.description, `Pine Labs ${o.order_id} captured Rs ${(amount/100).toFixed(0)}`, { order_id: o.order_id });
   // Scenario E9a: capture of exactly Rs 1,200 succeeds at Pine Labs but the reply times out.
   if (Number(amount) === 120000 && !o.timeout_shown) {
     o.timeout_shown = true;
@@ -268,15 +270,17 @@ function pinelabs_capture_order({ order_id, amount }) {
 }
 
 function pinelabs_cancel_order({ order_id, reason = 'Household requested cancellation' }) {
-  const o = orders.get(order_id);
+  const o = findOrder(order_id);
   if (!o) return { success: false, error: `Order ${order_id} not found` };
   if (o.status === 'CAPTURED') return { success: false, error: 'Cannot cancel a captured order — use pinelabs_create_refund instead' };
   o.status = 'CANCELLED'; o.cancelled_at = new Date().toISOString(); o.cancel_reason = reason;
+  logEvent(o.merchant_order_id || o.description, `Pine Labs hold ${o.order_id} cancelled — ${reason}`, { order_id: o.order_id });
   return { success: true, order_id, status: 'CANCELLED', cancelled_at: o.cancelled_at, message: 'Pre-auth released. No charge made to household.' };
 }
 
+function findOrder(id) { return orders.get(id) || [...orders.values()].reverse().find(o => o.merchant_order_id === id); }
 function pinelabs_get_order({ order_id }) {
-  const o = orders.get(order_id);
+  const o = findOrder(order_id);
   if (!o) return { found: false, order_id, error: `Order ${order_id} not found. Check merchant_order_id if you do not have the Pine Labs order_id.` };
   return { found: true, ...o };
 }
@@ -364,6 +368,7 @@ function onsitego_book_service({ serial, fault_description, preferred_date, pref
     created_at: new Date().toISOString(),
   };
   serviceRequests.set(sr_id, record);
+  logEvent(serial, `Service booked ${sr_id} for ${preferred_date} ${record.confirmed_slot} (${record.service_type})`, { service_request_id: sr_id, evidence: 'CLAIMED' });
   return {
     success: true,
     service_request_id: sr_id,
@@ -403,10 +408,12 @@ function onsitego_raise_dispute({ service_request_id, serial, charge_rs, reason,
   const dispute_id = `DSP-${String(serial || 'X').slice(-5)}-${Date.now().toString().slice(-6)}`;
   const rec = { dispute_id, service_request_id, serial, charge_rs, reason, clause, evidence_requested, centre, status: 'SENT_TO_CENTRE', raised_at: new Date().toISOString() };
   disputes.set(dispute_id, rec);
+  logEvent(serial, `Dispute ${dispute_id} raised: Rs ${charge_rs} — ${reason}`, { dispute_id, clause, evidence: 'UNRECONCILED' });
   return { success: true, ...rec, response_due: 'within 4 hours', note: `Dispute delivered to ${centre} via Onsitego service request.` };
 }
-function onsitego_dispute_status({ dispute_id }) {
-  const d = disputes.get(dispute_id);
+function onsitego_dispute_status({ dispute_id, serial }) {
+  let d = disputes.get(dispute_id);
+  if (!d && serial) { const list = [...disputes.values()].filter(x => resolveAppliance(x.serial) === resolveAppliance(serial)); d = list[list.length - 1]; }
   if (!d) return { found: false, dispute_id, status: 'PENDING', note: 'No centre response yet.' };
   if (/3\.5/.test(String(d.clause))) {
     return { found: true, ...d, status: 'CHARGE_WITHDRAWN', centre_response: 'Inspection/gas check is in-warranty diagnosis under CL-VLT-3.5. Charge of Rs ' + (d.charge_rs ?? '') + ' withdrawn. Rs 0 payable.' };
@@ -774,6 +781,50 @@ const TOOLS = [
   },
 ];
 
+// ─────────────────────────────────────────────
+// PERSISTENCE (Upstash Redis via REST). Falls back to memory if not configured.
+// ─────────────────────────────────────────────
+const KV_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const STATE_KEY = 'pakka_state_v1';
+const SEED_MEMORY = JSON.parse(JSON.stringify(SERVICE_MEMORY));
+async function kv(cmd) {
+  const r = await fetch(KV_URL, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(cmd), signal: AbortSignal.timeout(4000) });
+  if (!r.ok) throw new Error('kv ' + r.status);
+  return (await r.json()).result;
+}
+function fillMap(m, obj) { m.clear(); for (const [k, v] of Object.entries(obj || {})) m.set(k, v); }
+function resetState() {
+  serviceRequests.clear(); orders.clear(); shipments.clear(); disputes.clear();
+  for (const k of Object.keys(SERVICE_MEMORY)) delete SERVICE_MEMORY[k];
+  Object.assign(SERVICE_MEMORY, JSON.parse(JSON.stringify(SEED_MEMORY)));
+  srSeq = 1000; ordSeq = 5000;
+}
+async function loadState() {
+  if (!KV_URL || !KV_TOKEN) return 'memory';
+  try {
+    const raw = await kv(['GET', STATE_KEY]);
+    if (!raw) return 'kv-empty';
+    const st = JSON.parse(raw);
+    fillMap(serviceRequests, st.serviceRequests); fillMap(orders, st.orders); fillMap(shipments, st.shipments); fillMap(disputes, st.disputes);
+    for (const k of Object.keys(SERVICE_MEMORY)) delete SERVICE_MEMORY[k];
+    Object.assign(SERVICE_MEMORY, st.memory || JSON.parse(JSON.stringify(SEED_MEMORY)));
+    srSeq = st.srSeq || 1000; ordSeq = st.ordSeq || 5000;
+    return 'kv';
+  } catch (e) { console.error('[pakka-mock] kv load failed', String(e)); return 'kv-error'; }
+}
+async function saveState() {
+  if (!KV_URL || !KV_TOKEN) return;
+  const st = { serviceRequests: Object.fromEntries(serviceRequests), orders: Object.fromEntries(orders), shipments: Object.fromEntries(shipments), disputes: Object.fromEntries(disputes), memory: SERVICE_MEMORY, srSeq, ordSeq };
+  try { await kv(['SET', STATE_KEY, JSON.stringify(st)]); } catch (e) { console.error('[pakka-mock] kv save failed', String(e)); }
+}
+// Partner systems write their events into the household record (like webhooks), so a later run can find IDs.
+function logEvent(idOrSerial, event, extra = {}) {
+  const k = resolveAppliance(idOrSerial);
+  if (!k || !(k in SERVICE_MEMORY)) return;
+  SERVICE_MEMORY[k].push({ date: istToday(), event, ...extra });
+}
+
 // One server, four connectors: ?rail=delhivery|pinelabs|onsitego|gnani
 // returns only that rail's tools. No rail = all 17.
 const RAILS = ['delhivery', 'pinelabs', 'onsitego', 'gnani', 'pl'];
@@ -861,9 +912,14 @@ module.exports = async function handler(req, res) {
   const rail = (req.query && req.query.rail) || null;
   const railTools = toolsForRail(rail);
 
-  // Health check (GET)
+  // Health check (GET). ?reset=pakka-demo restores the seeded demo state (for re-recording).
+  if (req.method === 'GET' && req.query && req.query.reset === 'pakka-demo') {
+    resetState(); await saveState();
+    res.status(200).json({ status: 'reset', store: KV_URL ? 'kv' : 'memory' });
+    return;
+  }
   if (req.method === 'GET') {
-    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.10.0', rail: rail || 'all', tools: railTools.map(t => t.name) });
+    res.status(200).json({ status: 'ok', server: 'pakka-mock-mcp', version: '1.11.0', store: (KV_URL && KV_TOKEN) ? 'kv' : 'memory', rail: rail || 'all', tools: railTools.map(t => t.name) });
     return;
   }
 
@@ -903,7 +959,10 @@ module.exports = async function handler(req, res) {
         // platform may route a tool through a different connector URL than it listed it on.
         const args = normalizeArgs(params.arguments);
         console.log('[pakka-mock] call', JSON.stringify({ rail, tool: params.name, resolved: resolveToolName(params.name), raw: params.arguments, args }));
+        const store = await loadState();
         const toolResult = await callTool(params.name, args);
+        await saveState();
+        console.log('[pakka-mock] store', store);
         if (toolResult && typeof toolResult === 'object') toolResult._received_args = args;
         result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
         break;
