@@ -92,6 +92,17 @@ const ENTITLEMENTS = {
   },
 };
 
+
+// Find an entitlement by serial, appliance ID or contract ID, ignoring case/spaces.
+function findEntitlement(key) {
+  if (!key) return null;
+  const k = String(key).trim().toUpperCase().replace(/\s+/g, '');
+  for (const e of Object.values(ENTITLEMENTS)) {
+    if ([e.serial, e.appliance_id, e.contract_id].filter(Boolean).some(v => v.toUpperCase() === k)) return e;
+  }
+  return null;
+}
+
 // In-memory stores (reset on cold start — fine for demo)
 const serviceRequests = new Map();
 const orders = new Map();
@@ -161,7 +172,7 @@ function delhivery_maps_distance_matrix({ origin, destination }) {
 }
 
 function delhivery_entitlement_gate({ serial, part_code, service_event_id }) {
-  const ent = ENTITLEMENTS[serial];
+  const ent = findEntitlement(serial);
   if (!ent) {
     return {
       dispatch_allowed: false,
@@ -254,7 +265,7 @@ function pinelabs_create_refund({ order_id, amount, reason = 'Service not perfor
 // ──── Onsitego ────
 
 function onsitego_entitlement_lookup({ serial }) {
-  const ent = ENTITLEMENTS[serial];
+  const ent = findEntitlement(serial);
   if (!ent) {
     return {
       found: false, serial,
@@ -267,7 +278,7 @@ function onsitego_entitlement_lookup({ serial }) {
 
 function onsitego_book_service({ serial, fault_description, preferred_date, preferred_slot = 'morning', contact_name, contact_phone, address, pincode }) {
   const sr_id = `OSG-SR-${++srSeq}`;
-  const ent = ENTITLEMENTS[serial];
+  const ent = findEntitlement(serial);
   const paid = !ent || ent.status === 'NOT_COVERED';
   const slots = { morning: '10:00–13:00', afternoon: '13:00–17:00', evening: '17:00–19:00' };
   const record = {
@@ -582,6 +593,23 @@ function toolsForRail(rail) {
   return TOOLS.filter(t => t.name.startsWith(rail + '_'));
 }
 
+
+// AgenticOrg may send arguments as a JSON string or wrapped (e.g. {input:{...}}). Unwrap to a flat object.
+function normalizeArgs(a) {
+  if (a == null) return {};
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (_) { return { serial: a }; } }
+  for (let i = 0; i < 3 && a && typeof a === 'object'; i++) {
+    const keys = Object.keys(a);
+    if (keys.length === 1 && ['input','arguments','args','kwargs','params','parameters','tool_input'].includes(keys[0])) {
+      a = a[keys[0]];
+      if (typeof a === 'string') { try { a = JSON.parse(a); } catch (_) { return { serial: a }; } }
+    } else break;
+  }
+  // Accept common aliases for serial
+  if (a && a.serial == null) a.serial = a.serial_number || a.serialNumber || a.appliance_serial || a.appliance_id;
+  return a || {};
+}
+
 // ─────────────────────────────────────────────
 // DISPATCH
 // ─────────────────────────────────────────────
@@ -636,6 +664,7 @@ module.exports = async function handler(req, res) {
   if (!body || typeof body !== 'object') { res.status(400).json({ error: 'Body must be JSON' }); return; }
 
   const { jsonrpc, method, params, id } = body;
+  console.log('[pakka-mock] rpc', method, 'rail=' + (rail || 'all'));
 
   // Notifications require no response
   if (typeof method === 'string' && method.startsWith('notifications/')) {
@@ -661,8 +690,13 @@ module.exports = async function handler(req, res) {
 
       case 'tools/call': {
         if (!params || !params.name) throw { code: -32602, message: 'Missing params.name' };
-        if (!railTools.some(t => t.name === params.name)) throw { code: -32601, message: `Tool ${params.name} is not on rail ${rail}` };
-        const toolResult = await callTool(params.name, params.arguments || {});
+        // Rail only filters tools/list. Calls are accepted on any rail, because the
+        // platform may route a tool through a different connector URL than it listed it on.
+        console.log(`[pakka-mock] call rail=${rail || 'all'} tool=${params.name} args=${JSON.stringify(params.arguments || {})}`);
+        const args = normalizeArgs(params.arguments);
+        console.log('[pakka-mock] call', JSON.stringify({ rail, tool: params.name, raw: params.arguments, args }));
+        const toolResult = await callTool(params.name, args);
+        if (toolResult && typeof toolResult === 'object') toolResult._received_args = args;
         result = { content: [{ type: 'text', text: JSON.stringify(toolResult, null, 2) }] };
         break;
       }
