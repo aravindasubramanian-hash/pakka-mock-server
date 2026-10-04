@@ -123,6 +123,17 @@ const orders = new Map();
 const shipments = new Map();
 let srSeq = 1000, ordSeq = 5000;
 
+// ─────────────────────────────────────────────
+// DEMO-ONLY SIMULATED CLOCK (for proving the late/no-response branch on camera).
+// Real server time is never altered; this only offsets what onsitego_service_status
+// reports as "now" when computing elapsed time since a provider marked a job complete,
+// so a recording can show a visible 24h jump instead of asserting it verbally.
+// ─────────────────────────────────────────────
+let clockOffsetMs = 0;
+const completions = new Map(); // sr_id -> ISO completed_at (sim time when first observed complete)
+function simNow() { return Date.now() + clockOffsetMs; }
+function simNowIso() { return new Date(simNow()).toISOString(); }
+
 function uid() { return `${Date.now()}-${Math.floor(Math.random() * 9999)}`; }
 
 // ─────────────────────────────────────────────
@@ -453,13 +464,23 @@ function seededToday(id) {
   if (id !== 'OSG-SR-0500') return null;
   const today = istToday();
   const disputed = [...disputes.values()].some(d => resolveAppliance(d.serial) === 'AC-10234');
-  return {
+  const sr = {
     sr_id: 'OSG-SR-0500', serial: 'VLT-AC-2024-10234', fault_description: 'AC not cooling', preferred_date: today,
     confirmed_slot: '10:00–13:00', service_type: 'WARRANTY', contract_id: 'W-VLT-AC-2024-10234',
     technician_name: 'Suresh Sharma', technician_phone: '98765-00002', centre: 'VSC-GGN-01',
     status: disputed ? 'COMPLETED_BY_PROVIDER' : 'TECHNICIAN_ON_SITE',
     provider_note: disputed ? 'Centre reports gas pressure checked and topped up; AC cooling restored. Awaiting household confirmation.' : 'Technician on site, diagnosing.',
   };
+  if (disputed) {
+    // First time this job is observed as provider-completed, stamp it with the current
+    // simulated time. ?advance_hours=N later moves simNow() forward without touching this.
+    if (!completions.has('OSG-SR-0500')) completions.set('OSG-SR-0500', simNowIso());
+    const completed_at = completions.get('OSG-SR-0500');
+    sr.completed_at = completed_at;
+    sr.mock_now = simNowIso();
+    sr.elapsed_hours_since_completion = Math.round(((Date.parse(sr.mock_now) - Date.parse(completed_at)) / 3600000) * 100) / 100;
+  }
+  return sr;
 }
 function onsitego_service_status({ service_request_id }) {
   const sr = serviceRequests.get(service_request_id) || SEEDED_SR[service_request_id] || seededToday(service_request_id);
@@ -928,7 +949,8 @@ async function kv(cmd) {
 }
 function fillMap(m, obj) { m.clear(); for (const [k, v] of Object.entries(obj || {})) m.set(k, v); }
 function resetState() {
-  serviceRequests.clear(); orders.clear(); shipments.clear(); disputes.clear();
+  serviceRequests.clear(); orders.clear(); shipments.clear(); disputes.clear(); completions.clear();
+  clockOffsetMs = 0;
   for (const k of Object.keys(SERVICE_MEMORY)) delete SERVICE_MEMORY[k];
   Object.assign(SERVICE_MEMORY, JSON.parse(JSON.stringify(SEED_MEMORY)));
   SERVICE_MEMORY['AC-10234'] = SERVICE_MEMORY['AC-10234'].filter(e => e.service_request_id !== 'OSG-SR-0500').concat([todayBookingEvent()]);
@@ -941,6 +963,7 @@ async function loadState() {
     if (!raw) return 'kv-empty';
     const st = JSON.parse(raw);
     fillMap(serviceRequests, st.serviceRequests); fillMap(orders, st.orders); fillMap(shipments, st.shipments); fillMap(disputes, st.disputes);
+    fillMap(completions, st.completions); clockOffsetMs = st.clockOffsetMs || 0;
     for (const k of Object.keys(SERVICE_MEMORY)) delete SERVICE_MEMORY[k];
     Object.assign(SERVICE_MEMORY, st.memory || JSON.parse(JSON.stringify(SEED_MEMORY)));
     srSeq = st.srSeq || 1000; ordSeq = st.ordSeq || 5000;
@@ -949,7 +972,7 @@ async function loadState() {
 }
 async function saveState() {
   if (!KV_URL || !KV_TOKEN) return;
-  const st = { serviceRequests: Object.fromEntries(serviceRequests), orders: Object.fromEntries(orders), shipments: Object.fromEntries(shipments), disputes: Object.fromEntries(disputes), memory: SERVICE_MEMORY, srSeq, ordSeq };
+  const st = { serviceRequests: Object.fromEntries(serviceRequests), orders: Object.fromEntries(orders), shipments: Object.fromEntries(shipments), disputes: Object.fromEntries(disputes), completions: Object.fromEntries(completions), clockOffsetMs, memory: SERVICE_MEMORY, srSeq, ordSeq };
   try { await kv(['SET', STATE_KEY, JSON.stringify(st)]); } catch (e) { console.error('[pakka-mock] kv save failed', String(e)); }
 }
 // Partner systems write their events into the household record (like webhooks), so a later run can find IDs.
@@ -1050,6 +1073,27 @@ module.exports = async function handler(req, res) {
   if (req.method === 'GET' && req.query && req.query.reset === 'pakka-demo') {
     resetState(); await saveState();
     res.status(200).json({ status: 'reset', store: KV_URL ? 'kv' : 'memory' });
+    return;
+  }
+  // DEMO-ONLY time controls — screen-recordable proof of the late/no-response branch.
+  // GET ?advance_hours=24      → moves the simulated clock forward (persists across calls).
+  // GET ?mock_status=1         → shows mock_now + every tracked completion without changing anything.
+  // Real wall-clock time is untouched; only onsitego_service_status's elapsed-time math reads simNow().
+  if (req.method === 'GET' && req.query && (req.query.advance_hours !== undefined || req.query.mock_status !== undefined)) {
+    await loadState();
+    if (req.query.advance_hours !== undefined) {
+      const hours = Number(req.query.advance_hours);
+      if (!Number.isFinite(hours)) { res.status(400).json({ error: 'advance_hours must be a number' }); return; }
+      clockOffsetMs += hours * 3600000;
+      await saveState();
+    }
+    res.status(200).json({
+      status: req.query.advance_hours !== undefined ? 'advanced' : 'ok',
+      real_now: new Date().toISOString(),
+      mock_now: simNowIso(),
+      offset_hours: Math.round((clockOffsetMs / 3600000) * 100) / 100,
+      completions: Object.fromEntries(completions),
+    });
     return;
   }
   // Serves TTS audio bytes we stored in KV after a real Gnani TTS call (see gnani_text_to_speech).
